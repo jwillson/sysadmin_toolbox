@@ -120,6 +120,10 @@ mkdir -p /root/nfs-tuning && cd /root/nfs-tuning    # copy the script here
 less /root/nfs-tuning/preflight-*/report.txt
 ```
 
+Run it as root; without root, the subnet manager, export and firewall checks are incomplete. Three environment variables change its defaults: `THREADS=` overrides the computed nfsd thread count, `IPOIB_IF=` picks the IPoIB interface when there is more than one, and `OUT=` moves the report directory (default `/root/nfs-tuning`).
+
+Each run writes `preflight-<host>-<timestamp>/` with four files: `report.txt` (everything printed), `nfs.conf.orig` (the current file), `nfs.conf.proposed` (the version the plan installs) and `nfs-clients.txt` (hosts connected over TCP 2049, the mounts to convert).
+
 Run it again after each change and once after the window; the warnings should disappear as steps are completed.
 
 ### 0a. Save the current state
