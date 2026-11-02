@@ -20,18 +20,18 @@ Three points shape the plan:
 - **There are two MTUs.** The IB link MTU comes from the subnet manager's partition (EDR max 4096). The IPoIB MTU is the IP-layer value: IB MTU − 4 in datagram mode (2044 today, 4092 after), up to 65520 in connected mode. Your "2048" is most likely the IB MTU.
 - **With proto=rdma, NFS data does not cross IPoIB.** IPoIB is used only to resolve the server's address; reads and writes move over RDMA connections. IPoIB MTU and mode therefore matter for the TCP baseline, fallback and other IP traffic, while the IB MTU matters for RDMA.
 
-The IB MTU change and the nfs-server restart interrupt service cluster-wide; schedule a maintenance window.
+Only the IB MTU change, and the IPoIB MTU that follows it, needs a cluster-wide maintenance window. More nfsd threads, the RDMA listener, the `insecure` export option and a pilot client can all be done live beforehand. Run `nfs-rdma-preflight.sh` on the NAS first (Phase 3, step 0) to see which steps that host needs.
 
 ## Tools
 
-Every metric comes from standard EL8 packages; two scripts (sent alongside this doc) drive them and build the report.
+Every metric comes from standard EL8 packages; the scripts in this directory drive them and build the report.
 
 | Tool | Package | Runs on | What it measures |
 | --- | --- | --- | --- |
 | `fio` (libaio, O\_DIRECT) | fio | clients | NFS IOPS, bandwidth, mean and p99 latency |
 | `/proc/self/mountstats` | kernel (read by `mountstats`/`nfsiostat` in nfs-utils) | clients | per-RPC round-trip time for READ/WRITE |
 | `mpstat` | sysstat | server + clients | CPU busy % and kernel share during each test |
-| `/proc/fs/nfsd/pool_stats` | kernel | server | arrivals that had to wait for a free nfsd thread |
+| `/proc/fs/nfsd/pool_stats` | kernel | server | arrivals that found no idle nfsd thread: (packets-arrived − threads-woken) / packets-arrived |
 | `zpool iostat` | zfs | server | pool bandwidth/IOPS during each test |
 | `iperf3` | iperf3 | client → server | IPoIB TCP throughput |
 | `ib_write_bw`, `ib_read_bw`, `ib_read_lat` | perftest | client → server | raw RDMA ceiling of the fabric |
@@ -44,10 +44,11 @@ Install on the server and on the test clients:
 dnf install -y fio sysstat iperf3 perftest infiniband-diags libibverbs-utils rdma-core nfs-utils
 ```
 
-The two scripts:
+The scripts:
 
 - **`nfsbench.sh`** runs on a client. `run <label> <mount>` snapshots client and server config, runs the fabric tests, then a 7-test fio suite while sampling server and client CPU, nfsd thread pressure, zpool I/O and RPC times. Results land in `results/<label>/`. `./nfsbench.sh check` lists missing tools.
 - **`nfs_report.py`** reads one or more result directories and writes a self-contained HTML report plus a Markdown copy, with a % change column against the first run. It needs only Python 3.6+ (the platform python on Springdale 8).
+- **`nfs-rdma-preflight.sh`** runs on the NAS and changes nothing. It checks every precondition for the migration, works out that host's values (thread count, IPoIB MTU, the exact `nfs.conf` edit) and prints the commands, split into what can be done live and what needs the window.
 
 Server-side capture uses passwordless root ssh from the test client to the NAS (`SERVER_SSH`). Without it the fio numbers are still captured, but server CPU, nfsd and zpool columns stay empty. EL8's iperf3 (3.5) is single-threaded, so its 8 streams share one core; treat that number as a lower bound.
 
@@ -100,16 +101,28 @@ The report has a one-line-per-test summary, a configuration table (OS, CPU, ARC,
 
 How to read the baseline before changing anything:
 
-- **nfsd arrivals that waited for a free thread** above \~1–2% under load means the server is thread-starved. Expect this at 8 threads.
+- **nfsd arrivals that found no idle thread** above \~1–2% under load means the server is thread-starved. Expect this at 8 threads. (The `sockets-enqueued` column is not used: on EL8 kernels it always equals arrivals.)
 - **Server CPU in kernel** high during TCP tests is network-stack and copy overhead, which RDMA removes.
 - **fio latency far above the NFS RPC round-trip** means time is lost queuing on the client, not on the server or wire.
 - **Sequential read near the iperf3 figure** means IPoIB TCP is the ceiling; near the RDMA figure means the transport isn't the limit.
 
 ## Phase 3 — Migrate
 
-Work in this order: verify the link, raise the IB MTU, set IPoIB, size nfsd, enable RDMA on the server, then move clients one at a time. Steps 2, 3 and 5 interrupt service.
+Steps 1 and 4–5, plus a pilot of step 6 on one node, can be done live; TCP clients keep working. Steps 2–3 and moving the clients in step 6 interrupt service and belong in the window.
 
-### 0. Save the current state
+### 0. Dry run on the NAS
+
+`nfs-rdma-preflight.sh` reads the current state and changes nothing. It flags blockers: link not InfiniBand, no `rpcrdma` module, pool unhealthy, or a default boot kernel without a ZFS module. It finds the subnet manager and samples nfsd thread pressure. It also writes the proposed `nfs.conf` and the list of connected NFS clients. It ends with two numbered command lists for this host: before the window, and in the window.
+
+```bash
+mkdir -p /root/nfs-tuning && cd /root/nfs-tuning    # copy the script here
+./nfs-rdma-preflight.sh 60        # 60 s thread-pressure sample; run it during normal load
+less /root/nfs-tuning/preflight-*/report.txt
+```
+
+Run it again after each change and once after the window; the warnings should disappear as steps are completed.
+
+### 0a. Save the current state
 
 On the server and one client:
 
@@ -191,11 +204,11 @@ nfsd threads mostly wait on ZFS and the network, so more threads than cores is n
 ```bash
 lscpu | grep -E '^(CPU\(s\)|Socket|Core|Thread|NUMA node\(s\))'
 grep -s RPCNFSDCOUNT /etc/sysconfig/nfs                     # EL8 ignores this file; nfs.conf wins
-rpc.nfsd 64                                                 # takes effect now, no restart
+echo 64 > /proc/fs/nfsd/threads                             # takes effect now, no restart
 cat /proc/fs/nfsd/threads
 ```
 
-Make it persistent in `/etc/nfs.conf` under `[nfsd]` with `threads=64` (done in step 5). Validate with the report: if *nfsd arrivals that waited* stays above \~1–2% under the multi-client run, raise threads by half and re-run; stop around 256 unless the data says otherwise.
+Make it persistent in `/etc/nfs.conf` under `[nfsd]` with `threads=64` (done in step 5). Validate with the report: if *nfsd arrivals that found no idle thread* stays above \~1–2% under the multi-client run, raise threads by half and re-run; stop around 256 unless the data says otherwise.
 
 Optional for a dual-socket R440: `options sunrpc pool_mode=pernode` in `/etc/modprobe.d/sunrpc.conf` (applied at reboot) gives each socket its own thread pool. Test it as its own labelled run rather than bundling it with the rest.
 
@@ -217,13 +230,17 @@ rdma=y
 rdma-port=20049
 ```
 
+Add the listener to the running server; no restart, TCP clients unaffected:
+
 ```bash
 firewall-cmd --permanent --add-port={20049/tcp,20049/udp} && firewall-cmd --reload
-systemctl restart nfs-server
+echo 'rdma 20049' > /proc/fs/nfsd/portlist
 cat /proc/fs/nfsd/portlist                                  # rdma 20049 and tcp 2049
 ```
 
-RDMA traffic bypasses netfilter, but Red Hat's procedure opens the port and it does no harm. The restart starts an NFSv4 grace period (90 s by default) during which v4 clients stall. Exports, ZFS `sharenfs` and the pool need no changes. Keeping `tcp=y` leaves TCP available as a fallback.
+RDMA traffic bypasses netfilter, but Red Hat's procedure opens the port and it does no harm. The `nfs.conf` edit makes the listener and thread count persist; `systemctl restart nfs-server` proves it but starts an NFSv4 grace period (90 s by default) during which v4 clients stall, so leave that for the window.
+
+Exports need the `insecure` option: the kernel's NFS/RDMA documentation requires it because RDMA clients don't use a reserved source port. Add it to each client spec in `/etc/exports` and run `exportfs -ra`. For ZFS datasets, append it to `sharenfs` (`zfs set sharenfs='<current>,insecure' <dataset>`); the preflight prints the exact commands. Keeping `tcp=y` leaves TCP available as a fallback.
 
 ### 6. Move the clients to RDMA
 
@@ -283,7 +300,7 @@ What to expect, and what it means if you don't see it:
 - **Small I/O and QD1 latency:** the largest relative gains, with lower server kernel CPU. If they don't move, check the configuration table says `rdma` for the transport.
 - **Large sequential reads (warm):** should approach the RDMA ceiling until a client's CPU or the server's memory bandwidth becomes the limit; the multi-client run shows the server's limit.
 - **Writes:** if sync-heavy, often bound by the ZFS intent log and SLOG rather than the transport, so gains may be modest. Check `zpool iostat` output for the log device.
-- **nfsd arrivals that waited** should be near zero with the new thread count; if not, raise threads and re-run.
+- **nfsd arrivals that found no idle thread** should be near zero with the new thread count; if not, raise threads and re-run.
 
 ## Troubleshooting
 
@@ -291,11 +308,11 @@ What to expect, and what it means if you don't see it:
 | --- | --- | --- |
 | `mount: Protocol not supported` | RDMA client module not loaded, or an OFED build without NFS over RDMA | `modprobe xprtrdma`; `modinfo rpcrdma` |
 | RDMA mount hangs or times out | Server has no RDMA listener, wrong address, or SM down | `cat /proc/fs/nfsd/portlist`; ping the server's IPoIB address; `ibstat` shows Active |
-| Access denied over RDMA, TCP works | Export rejects the client's non-reserved source port | Add `insecure` to that export (the kernel's NFS/RDMA notes call for it), then `exportfs -ra` |
+| Access denied over RDMA, TCP works | Export lacks `insecure`, so it rejects the client's non-reserved source port | Add `insecure` to that export (step 5), then `exportfs -ra` |
 | `active_mtu` still 2048 after step 2 | Partition not reloaded, or IPoIB not re-joined | Restart opensm; bounce `ib0` or reboot the node |
 | Mode stays `datagram` after option B | Enhanced IPoIB still active | Use option A, or set `ipoib_enhanced=0` on the module that offers it and rebuild initramfs |
 | Large IP packets dropped, small ones fine | IPoIB MTU differs between hosts | Same MTU on every host in the subnet |
-| High *nfsd arrivals that waited* | Too few threads for the load | Raise `threads=` by half; re-run the multi-client capture |
+| High *nfsd arrivals that found no idle thread* | Too few threads for the load | Raise `threads=` by half; re-run the multi-client capture |
 | `rpcrdma` errors or reconnects in `dmesg` | Fabric errors on a port or cable | `ibqueryerrors`; `perfquery -x` on the affected ports |
 
 ## Sources
@@ -304,3 +321,4 @@ What to expect, and what it means if you don't see it:
 - [NVIDIA MLNX\_OFED: IP over InfiniBand](<https://docs.nvidia.com/networking/display/ofedv501000/ip+over+infiniband+(ipoib)>) — partition `mtu=5`, `ipoib_enhanced`
 - [NVIDIA MLNX\_OFED 5.1: Enhanced IPoIB](<https://docs.nvidia.com/networking/display/mlnxofedv512620/ip+over+infiniband+(ipoib)>) — datagram only, no connected mode
 - [Linux kernel: knfsd statistics (pool\_stats)](https://docs.kernel.org/filesystems/nfs/knfsd-stats.html)
+- [Linux kernel: NFS/RDMA](https://www.kernel.org/doc/Documentation/filesystems/nfs/nfs-rdma.txt) — adding the listener through `/proc/fs/nfsd/portlist`, `insecure` exports

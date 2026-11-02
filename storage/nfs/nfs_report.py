@@ -147,13 +147,17 @@ def parse_pool_stats(path):
 
 
 def nfsd_queue_pct(before, after):
+    """% of arrivals that found no idle nfsd thread: (arrived - woken) / arrived.
+
+    sockets-enqueued is not used: on EL8 kernels it equals packets-arrived.
+    """
     if not before or not after:
         return None
     arr = after.get("packets-arrived", 0) - before.get("packets-arrived", 0)
-    enq = after.get("sockets-enqueued", 0) - before.get("sockets-enqueued", 0)
+    woke = after.get("threads-woken", 0) - before.get("threads-woken", 0)
     if arr <= 0:
         return None
-    return 100.0 * enq / arr
+    return max(0.0, 100.0 * (arr - woke) / arr)
 
 
 MOUNT_RE = re.compile(r"^device (\S+) mounted on (\S+) with fstype (nfs\S*)")
@@ -402,7 +406,7 @@ def build_rows(runs):
              "vals": [g(r, "fio", t, "server_cpu", "kernel") for r in runs]},
             {"name": "Client CPU busy (avg of clients)", "unit": "%", "nd": 1, "better": "down",
              "vals": [g(r, "fio", t, "client_cpu") for r in runs]},
-            {"name": "nfsd arrivals that waited for a free thread", "unit": "%", "nd": 2,
+            {"name": "nfsd arrivals that found no idle thread", "unit": "%", "nd": 2,
              "better": "down", "vals": [g(r, "fio", t, "nfsd_queue_pct") for r in runs]},
         ]
         sections.append((TEST_TITLES.get(t, t), "fio test: " + t, rows))
