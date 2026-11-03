@@ -254,19 +254,19 @@ Pilot one node, re-run the fio suite on it, then roll out by rack.
 dnf install -y rdma-core nfs-utils
 echo xprtrdma > /etc/modules-load.d/nfs-rdma.conf && modprobe xprtrdma
 umount /mnt/scratch
-mount -t nfs -o proto=rdma,port=20049,vers=3,rsize=1048576,wsize=1048576,hard nas01-ib:/tank/scratch /mnt/scratch
+mount -t nfs -o proto=rdma,port=20049,vers=4.2,rsize=1048576,wsize=1048576,hard nas01-ib:/tank/scratch /mnt/scratch
 nfsstat -m | grep -A1 /mnt/scratch                          # proto=rdma
 grep -A4 'on /mnt/scratch ' /proc/self/mountstats | grep xprt   # xprt: rdma ...
 ```
 
-Keep `vers` and `rsize`/`wsize` the same as the baseline. Mount by the server's IPoIB name or address; RDMA uses it to find the server. Then make it permanent:
+Keep `vers=4.2`, which the clients already mount, and `rsize`/`wsize` the same as the baseline, so only the transport changes. Mount by the server's IPoIB name or address; RDMA uses it to find the server. Then make it permanent:
 
 ```text
 # /etc/fstab
-nas01-ib:/tank/scratch  /mnt/scratch  nfs  proto=rdma,port=20049,vers=3,rsize=1048576,wsize=1048576,hard,_netdev  0 0
+nas01-ib:/tank/scratch  /mnt/scratch  nfs  proto=rdma,port=20049,vers=4.2,rsize=1048576,wsize=1048576,hard,_netdev  0 0
 
 # autofs map entry
-scratch  -fstype=nfs,proto=rdma,port=20049,vers=3,hard  nas01-ib:/tank/scratch
+scratch  -fstype=nfs,proto=rdma,port=20049,vers=4.2,hard  nas01-ib:/tank/scratch
 ```
 
 Watch `dmesg | grep -i rpcrdma` on the pilot node for an hour of real jobs before rolling out further.

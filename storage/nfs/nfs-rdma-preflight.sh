@@ -406,10 +406,10 @@ fi
 # ------------------------------------------------------------------ plan
 ip_only=${addr%/*}
 live "Pilot ONE client over RDMA (only that node is affected; RDMA works at the current IB MTU)
-    # on the client, with the same vers/rsize/wsize it uses today:
+    # on the client, with the same rsize/wsize it uses today:
     dnf install -y rdma-core nfs-utils && modprobe xprtrdma
     mkdir -p /mnt/rdmatest
-    mount -t nfs -o proto=rdma,port=$RDMA_PORT,hard ${ip_only:-<NAS IPoIB address>}:${first_export:-<export>} /mnt/rdmatest
+    mount -t nfs -o proto=rdma,port=$RDMA_PORT,vers=4.2,hard ${ip_only:-<NAS IPoIB address>}:${first_export:-<export>} /mnt/rdmatest
     grep -A4 ' /mnt/rdmatest ' /proc/self/mountstats | grep xprt    # expect: xprt: rdma
     # optional: ./nfsbench.sh fio pilot /mnt/rdmatest ; then umount /mnt/rdmatest"
 
