@@ -46,7 +46,7 @@ NFSv4.2: every client mounts `vers=4.2`, so the server must offer it. EL8 and la
 ## Hardware notes
 
 - **HCA driver.** ConnectX-4 and newer use mlx5, which runs Enhanced IPoIB: datagram mode only, unless the driver exposes `ipoib_enhanced`. ConnectX-3 uses mlx4, which has no Enhanced IPoIB and supports connected mode directly. EL10 dropped mlx4, so a ConnectX-3 host there has no driver at all; keep it on EL9 or older, or replace the card.
-- **PCIe slot.** RDMA moves data at close to wire speed, so the slot can become the limit. PCIe 3.0 x16 carries about 126 Gb/s and x8 about 63 Gb/s. An EDR (100 Gb/s) card in an x8 slot, or a card that negotiated fewer lanes than it supports, tops out well below line rate. The preflight compares the negotiated PCIe link with the IB rate and warns. On servers with several riser options, such as the R730xd, check which slots are x16.
+- **PCIe slot.** RDMA moves data at close to wire speed, so the slot can become the limit. PCIe 3.0 x16 carries about 126 Gb/s and x8 about 63 Gb/s. An EDR (100 Gb/s) card in an x8 slot, or a card that negotiated fewer lanes than it supports, tops out well below line rate. The preflight compares the negotiated PCIe link with the IB rate and warns. On servers with several riser options, check which slots are x16.
 - **NUMA.** The preflight shows which NUMA node the HCA hangs off. On dual-socket hosts the per-node nfsd pools (below) keep threads near their memory.
 - **Storage.** On ZFS, the preflight checks pool health, ZFS modules for the boot kernel, and `sharenfs` options. On other filesystems it checks md arrays and, when `perccli`/`storcli` is installed, PERC/MegaRAID virtual drives. Capture uses `zpool iostat` on ZFS servers and `iostat -x` otherwise.
 
@@ -97,6 +97,20 @@ The captures need the NAS under test quiet, not the whole cluster. Other users' 
 The 2 hours covers two single-client runs, two multi-client runs and setup. Jobs that use other storage, or only compute, can keep running. Run the after capture straight after the window, while the cluster is still drained, so the client only arranges two interruptions.
 
 No quiet period is needed for the preflight or the live steps (4–5 and the pilot client). The preflight should run under normal load, because it samples nfsd thread pressure from real traffic.
+
+### On a Slurm cluster
+
+Each quiet period is a maintenance reservation. Compare `nfs-clients.txt` with `sinfo -N`: if every compute node mounts this NAS, a quiet NAS means no jobs anywhere, so reserve all nodes. Otherwise reserve the nodes that mount it, plus the test nodes. Create the reservation at least one maximum job time limit ahead (`sinfo -o '%P %l'`); Slurm then starts no job that would run into it.
+
+```bash
+scontrol create reservation reservationname=nfs-bench starttime=2026-11-20T08:00:00 duration=02:00:00 \
+    nodes=ALL users=root flags=maint,ignore_jobs
+scontrol show reservation nfs-bench
+squeue -t R -h | wc -l                                     # 0 once it starts; jobs already running past the start keep running
+scontrol delete reservationname=nfs-bench                  # when done
+```
+
+A reservation doesn't cover login nodes, where users can still touch the NAS. Announce each quiet period to users as well.
 
 ### Ground rules
 
@@ -152,7 +166,14 @@ How to read the baseline before changing anything:
 
 ## Phase 3 — Migrate
 
-Steps 1 and 4–5, plus a pilot of step 6 on one node, can be done live; TCP clients keep working. Steps 2–3, enabling NFSv4.2 where it is off, and moving the clients in step 6 interrupt service and belong in the window.
+Steps 1 and 4–5, plus a pilot of step 6 on one node, can be done live; TCP clients keep working. Steps 2–3, enabling NFSv4.2 where it is off, and moving the clients in step 6 interrupt service and belong in the window. On Slurm, groups of nodes can also be drained and moved beforehand (step 6).
+
+On a Slurm cluster, before the window:
+
+- **Reserve it.** Create a maintenance reservation on all nodes, as in Phase 1, covering the window plus about 2 h for the after capture. Create it at least one maximum job time limit ahead.
+- **Check what Slurm keeps on this NAS.** Run `scontrol show config | grep -E 'StateSaveLocation|SlurmdSpoolDir'`, and check whether home directories live here. If the controller's state is on this NAS, slurmctld stalls whenever the NAS is unreachable: during the IPoIB bounce and the nfs-server restart's grace period (90 s by default).
+- **Check whether Slurm traffic uses IPoIB.** If node addresses in `slurm.conf` are on IPoIB, the step 3 bounce briefly cuts slurmctld off from slurmd. A node unreachable for longer than `SlurmdTimeout` is marked DOWN; bring it back with `scontrol update nodename=<node> state=resume`.
+- **Include the login nodes.** They need the same IPoIB MTU and client change, and users there should know about the window.
 
 ### 0. Dry run on each NAS
 
@@ -281,7 +302,9 @@ Use the same IPoIB MTU on every host in the IPoIB subnet (NAS, compute, login no
 
 ### 4. Size the nfsd threads
 
-nfsd threads mostly wait on storage and the network, so more threads than cores is normal; 8 is a small-server default. Start at **max(64, logical CPUs rounded up to a multiple of 16)**. For example, a dual 12-core R440 (48 logical CPUs) gets 64, a dual 14-core R730xd (56) gets 64, and a dual 22-core (88) gets 96. The preflight never proposes fewer threads than the host already runs.
+nfsd threads mostly wait on storage and the network, so more threads than cores is normal; 8 is a small-server default. Start at **max(64, logical CPUs rounded up to a multiple of 16)**. For example, a host with 24 or 48 logical CPUs gets 64, and one with 88 gets 96. The preflight never proposes fewer threads than the host already runs.
+
+On a shared HPC cluster, start higher. Slurm jobs that span many nodes read inputs and write checkpoints from all of them at once, so burst concurrency is far above the average. With 20 or more clients, 128 is a reasonable start; `THREADS=128` makes the preflight plan it.
 
 ```bash
 lscpu | grep -E '^(CPU\(s\)|Socket|Core|Thread|NUMA node\(s\))'
@@ -341,6 +364,17 @@ Exports need the `insecure` option: the kernel's NFS/RDMA documentation requires
 
 Pilot one node, re-run the fio suite on it, then roll out by rack.
 
+On a Slurm cluster, drain a node before touching its mounts; a mount a job is using can't be unmounted. For the pilot:
+
+```bash
+scontrol update nodename=node01 state=drain reason="nfs-rdma pilot"
+squeue -w node01                                            # wait until empty
+# switch the mount as below and run the fio suite, then:
+scontrol update nodename=node01 state=resume
+```
+
+After the pilot, you can move further nodes the same way, a group at a time (`nodename=node[09-16]`), before the window; RDMA mounts don't depend on the IPoIB MTU. Switch whatever is left during the window, when every node is already idle.
+
 ```bash
 dnf install -y rdma-core nfs-utils                          # EL7: yum; Ubuntu: apt-get install -y rdma-core nfs-common
 echo xprtrdma > /etc/modules-load.d/nfs-rdma.conf && modprobe xprtrdma
@@ -360,13 +394,15 @@ nas01-ib:/tank/scratch  /mnt/scratch  nfs  proto=rdma,port=20049,vers=4.2,rsize=
 scratch  -fstype=nfs,proto=rdma,port=20049,vers=4.2,hard  nas01-ib:/tank/scratch
 ```
 
+With autofs, the new options apply at the next mount. After editing the map on an idle node, run `systemctl reload autofs` and unmount any automounts still active.
+
 Watch `dmesg | grep -i rpcrdma` on the pilot node for an hour of real jobs before rolling out further.
 
 ### 7. Roll back
 
 Reverse order, clients first:
 
-1. Clients: restore the old fstab/autofs line and remount with `proto=tcp`.
+1. Clients: restore the old fstab/autofs line and remount with `proto=tcp`. On Slurm, drain them first.
 2. Server: set `rdma=n` in `nfs.conf` (EL7: drop `--rdma` from `RPCNFSDARGS`), or leave it (an idle listener is harmless), and restart nfs-server.
 3. IPoIB: re-apply the saved MTU and mode from `/root/pre-rdma/` (nmcli, netplan or ifcfg); remove `ipoib-cm.conf` if used and rebuild the initramfs.
 4. Subnet manager: restore the old partitions file, restart opensm and bounce IPoIB.
