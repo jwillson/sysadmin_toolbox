@@ -83,11 +83,26 @@ Server-side capture uses passwordless root ssh from the test client to the NAS (
 
 ## Phase 1 — Capture the baseline
 
-One `run` takes about 15 minutes and records config, fabric ceiling and seven fio tests. Do it on a quiet cluster, then repeat it unchanged after the migration.
+One `run` takes about 15 minutes and records config, fabric ceiling and seven fio tests. Do it while the NAS is quiet, then repeat it unchanged after the migration.
 
-Ground rules, so before and after are comparable:
+### Quiet periods to ask for
 
-- Drain or reserve the test nodes; other jobs' I/O skews every number. Check the NAS is near idle first (`zpool iostat 1` on ZFS, `iostat -x 1` otherwise).
+The captures need the NAS under test quiet, not the whole cluster. Other users' I/O mixes into the numbers, so before and after stop being comparable. The benchmark also pushes the NAS to its limits, so anyone using it during a run sees slow I/O. Ask the cluster owner for two quiet periods:
+
+| Period | Length | What's needed |
+| --- | --- | --- |
+| Baseline (Phase 1) | about 2 h; more with `baseline-cold` | no other jobs using this NAS; the test nodes (e.g. node01–08) reserved, such as with a Slurm reservation |
+| Migration window, then the after capture (Phases 3–4) | the window, then about 2 h | cluster drained for the window; kept off this NAS for the after capture |
+
+The 2 hours covers two single-client runs, two multi-client runs and setup. Jobs that use other storage, or only compute, can keep running. Run the after capture straight after the window, while the cluster is still drained, so the client only arranges two interruptions.
+
+No quiet period is needed for the preflight or the live steps (4–5 and the pilot client). The preflight should run under normal load, because it samples nfsd thread pressure from real traffic.
+
+### Ground rules
+
+So before and after are comparable:
+
+- Before each run, check the NAS is idle: `zpool iostat 1` on ZFS, `iostat -x 1` otherwise, and `cat /proc/fs/nfsd/pool_stats` twice, 10 s apart, where packets-arrived should barely move. Idle autofs mounts stay connected, so a client in `nfs-clients.txt` isn't necessarily active.
 - Keep the same clients, export, NFS version and rsize/wsize for every run. Note the current options with `nfsstat -m`.
 - Write results to local disk on the client (`RESULTS=/root/nfsbench/results`), not to the NFS share.
 - Run each capture twice. More than \~5% difference between the two means the cluster wasn't quiet.
