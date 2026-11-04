@@ -267,12 +267,37 @@ for d in /sys/class/infiniband/*; do
   done
 done
 ((ndev)) || fail "no InfiniBand devices found under /sys/class/infiniband"
-if [[ -n $cur_mtu ]]; then
-  if [[ $cur_mtu -ge $TARGET_IB_MTU ]]; then pass "IB link MTU already $cur_mtu"
-  else warn "IB link MTU is $cur_mtu; target $TARGET_IB_MTU is set at the subnet manager (see below)"; fi
+# Two IB MTUs matter. The port's active_mtu is negotiated per link and can already read 4096.
+# IPoIB is capped by its partition's broadcast group MTU, which the subnet manager sets.
+port_mtu=$cur_mtu part_mtu="" part_src=""
+if [[ -n $IF ]]; then
+  pk=$(rd "/sys/class/net/$IF/pkey"); pk=${pk#0x}; [[ $pk =~ ^[0-9a-fA-F]+$ ]] || pk=ffff
+  bc=$(printf 'ff12:401b:%x::ffff:ffff' $((16#$pk | 0x8000)))   # IPv4 broadcast group of this P_Key
+  if have saquery; then
+    v=$(saquery -g 2>/dev/null | awk -v bc="$bc" '{v=$0; sub(/^[[:space:]]*[A-Za-z]+\.+/, "", v)}
+          /MGID/ {g=tolower(v)} /Mtu/ && g==bc {print v; exit}')
+    [[ $v =~ ^0x[0-9a-fA-F]+$ ]] && part_mtu=$((128 << (v & 63))) && part_src="broadcast group $bc"
+  fi
+  if [[ -z $part_mtu ]]; then
+    m=$(rd "/sys/class/net/$IF/mtu"); md=$(rd "/sys/class/net/$IF/mode")
+    if [[ $md == datagram && $m =~ ^[0-9]+$ ]] && ((m + 4 < ${port_mtu:-0})); then
+      part_mtu=$((m + 4)); part_src="inferred from $IF datagram MTU $m; saquery -g as root confirms it"
+    fi
+  fi
+fi
+if [[ -n $port_mtu ]]; then
+  if ((port_mtu >= TARGET_IB_MTU)); then pass "IB port MTU already $port_mtu"
+  else warn "IB port MTU is $port_mtu; target $TARGET_IB_MTU is set at the subnet manager (see below)"; fi
+fi
+if [[ -n $part_mtu ]]; then
+  if ((part_mtu >= TARGET_IB_MTU)); then pass "partition MTU $part_mtu ($part_src)"
+  else warn "partition MTU is $part_mtu ($part_src): IPoIB stays at $((part_mtu - 4)) or below until the subnet manager raises it to $TARGET_IB_MTU"; fi
+  ((part_mtu < ${cur_mtu:-99999})) && cur_mtu=$part_mtu
+elif [[ -n $IF ]]; then
+  info "could not read the partition MTU (needs saquery from infiniband-diags, as root)"
 fi
 hdev=${ibdev:-$(ls /sys/class/infiniband 2>/dev/null | head -1)}; hdev=${hdev:-none}
-profile HCA "${IBDEV_HCA[$hdev]:-?} ($hdev, ${IBDEV_DRV[$hdev]:-?}), ${ib_rate:-link down}, IB MTU ${cur_mtu:-?}"
+profile HCA "${IBDEV_HCA[$hdev]:-?} ($hdev, ${IBDEV_DRV[$hdev]:-?}), ${ib_rate:-link down}, IB MTU port ${port_mtu:-?} / partition ${part_mtu:-?}"
 
 # ------------------------------------------------------------------ subnet manager
 head1 "Subnet manager"
@@ -665,9 +690,9 @@ live "Pilot ONE client over RDMA (only that node is affected; RDMA works at the 
     grep -A4 ' /mnt/rdmatest ' /proc/self/mountstats | grep xprt    # expect: xprt: rdma
     # optional: ./nfsbench.sh fio pilot /mnt/rdmatest ; then umount /mnt/rdmatest"
 
-window "Confirm the new MTU everywhere
-    ibv_devinfo | grep active_mtu                       # this host: $TARGET_IB_MTU
-    pdsh -a 'ibv_devinfo | grep active_mtu' | dshbak -c # every node"
+window "Confirm the new MTU everywhere (IPoIB only reaches $((TARGET_IB_MTU - 4)) once the partition is $TARGET_IB_MTU)
+    cat /sys/class/net/${IF:-ib0}/mtu                          # this host: $((TARGET_IB_MTU - 4))
+    pdsh -a 'cat /sys/class/net/ib0/mtu' | dshbak -c   # every node: $((TARGET_IB_MTU - 4)); $((TARGET_IB_MTU / 2 - 4)) means the partition is still $((TARGET_IB_MTU / 2))"
 if ((need42)); then
   window "Restart nfs-server to turn on NFSv4.2 and load the staged config (NFSv4 clients pause for the grace period)
     systemctl restart nfs-server
@@ -680,7 +705,7 @@ if ((!need42)); then
     cat $NFSD_PROC/portlist $NFSD_PROC/threads"
 fi
 
-verify "Re-run this script: every [WARN] above should be gone and the IB MTU should read $TARGET_IB_MTU"
+verify "Re-run this script: every [WARN] above should be gone, and the port and partition MTU should both read $TARGET_IB_MTU"
 verify "On a client: nfsstat -m shows proto=rdma,vers=4.2; then capture the after-run with nfsbench.sh"
 verify "dmesg -T | grep -iE 'rpcrdma|svcrdma' on the NAS and a client: no errors"
 

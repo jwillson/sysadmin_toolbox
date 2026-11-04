@@ -8,7 +8,7 @@ This runbook moves an InfiniBand-attached NAS and its clients from NFS over TCP/
 
 | Item | Typical now | Target |
 | --- | --- | --- |
-| IB link MTU (set by the subnet manager) | 2048 | 4096 |
+| IB partition MTU (set by the subnet manager) | 2048 | 4096 |
 | IPoIB mode / MTU | datagram / 2044 | datagram / 4092 (recommended), or connected / 65520 |
 | nfsd threads | 8 (distribution default) | max(64, logical CPUs rounded up to a multiple of 16), validated by measurement |
 | Server listeners | tcp 2049 | rdma 20049 + tcp 2049 (TCP kept as fallback) |
@@ -19,7 +19,7 @@ Each NAS is different, so start every host with the preflight (Phase 3, step 0).
 Three points shape the plan:
 
 - **The ports are usually already in InfiniBand mode.** IPoIB only runs on the IB link layer, so if IPoIB works, RDMA is available; NFS just isn't using it. The real change is the NFS transport.
-- **There are two MTUs.** The IB link MTU comes from the subnet manager's partition (4096 max on FDR and EDR). The IPoIB MTU is the IP-layer value: IB MTU − 4 in datagram mode (2044 at 2048, 4092 at 4096), up to 65520 in connected mode. A "2048" seen on a host is most likely the IB MTU.
+- **There are two MTUs.** The IB MTU that matters here comes from the subnet manager's partition (4096 max on FDR and EDR). Each port also reports its own `active_mtu`, which can already read 4096 while the partition is still 2048. The IPoIB MTU is the IP-layer value: IB MTU − 4 in datagram mode (2044 at 2048, 4092 at 4096), up to 65520 in connected mode. So IPoIB at 2044 in datagram mode means the partition is 2048, whatever `active_mtu` says.
 - **With proto=rdma, NFS data does not cross IPoIB.** IPoIB is used only to resolve the server's address; reads and writes move over RDMA connections. IPoIB MTU and mode therefore matter for the TCP baseline, fallback and other IP traffic, while the IB MTU matters for RDMA.
 
 Only the IB MTU change, and the IPoIB MTU that follows it, needs a cluster-wide maintenance window. More nfsd threads, the RDMA listener, the `insecure` export option and a pilot client can all be done live beforehand. Turning on NFSv4.2 on a server that has it disabled needs an nfsd restart, so it also goes in the window.
@@ -205,7 +205,7 @@ ibstat | grep -E 'CA type|State|Rate|Link layer'          # Active, 100 (EDR) or
 ibv_devinfo | grep -E 'hca_id|link_layer|max_mtu|active_mtu'
 ```
 
-Expect `Link layer: InfiniBand`, `max_mtu: 4096`, and today `active_mtu: 2048`. Since IPoIB works, the link layer is already InfiniBand. Only if a VPI port shows `Ethernet` (ConnectX-3 through current cards):
+Expect `Link layer: InfiniBand` and `max_mtu: 4096`. `active_mtu` may read 2048 or already 4096; either way the partition (step 2) is what caps IPoIB. Since IPoIB works, the link layer is already InfiniBand. Only if a VPI port shows `Ethernet` (ConnectX-3 through current cards):
 
 ```bash
 dnf install -y mstflint                                   # apt-get on Ubuntu
@@ -218,7 +218,13 @@ If MLNX\_OFED or DOCA-OFED is installed instead of the inbox stack (`ofed_info -
 
 ### 2. Raise the IB MTU to 4096 at the subnet manager
 
-The link MTU is set by the subnet manager's partition, not on the hosts. Find where the SM runs with `sminfo` (SM LID), then `smpquery nodedesc <lid>`.
+The MTU that caps IPoIB is set by the subnet manager's partition, not on the hosts. Check it from any node as root; the IPoIB broadcast group's `Mtu` field ends in 4 for 2048 and 5 for 4096 (e.g. `0x84`, `0x85`):
+
+```bash
+saquery -g | grep -A2 'ff12:401b:ffff::ffff:ffff'          # default partition's IPv4 broadcast group
+```
+
+Find where the SM runs with `sminfo` (SM LID), then `smpquery nodedesc <lid>`.
 
 - **OpenSM on a host:** in the partitions file, set the default partition to `mtu=5` (5 = 4096), then `systemctl restart opensm`. The file is usually `/etc/rdma/partitions.conf` on EL and `/etc/opensm/partitions.conf` on Ubuntu; check `partition_config_file` in the opensm config.
 
@@ -228,10 +234,10 @@ Default=0x7fff, ipoib, mtu=5 : ALL=full;
 
 - **SM on a managed switch or UFM:** set the Default partition's MTU to 4K in the switch's partition settings, following its vendor documentation.
 
-The IPoIB broadcast group is re-created at the new MTU, so bounce IPoIB on every node (step 3 does this) or reboot them. Then check the whole cluster:
+The IPoIB broadcast group is re-created at the new MTU, so bounce IPoIB on every node (step 3 does this) or reboot them. Re-run the `saquery` check, then after step 3 check the whole cluster:
 
 ```bash
-pdsh -a 'ibv_devinfo | grep active_mtu' | dshbak -c          # every node: 4096 (5)
+pdsh -a 'cat /sys/class/net/ib0/mtu' | dshbak -c           # every node: 4092; 2044 means the partition is still 2048
 ```
 
 ### 3. Set IPoIB mode and MTU (server and every client)
@@ -402,7 +408,7 @@ What to expect, and what it means if you don't see it:
 | Settings revert after restart (EL9+, Ubuntu) | An `/etc/nfs.conf.d/*.conf` file overrides `nfs.conf` | `nfsconf --dump`; fix or remove the overriding line |
 | No IB device after upgrading to EL10 | ConnectX-3 (mlx4) driver removed in EL10 | Stay on EL9 for that host, or move to ConnectX-4 or newer |
 | RDMA bandwidth well below link rate | HCA in an x8 slot or negotiated fewer lanes | Preflight's PCIe line; `lspci -vv -s <pci>` LnkSta; move to an x16 slot |
-| `active_mtu` still 2048 after step 2 | Partition not reloaded, or IPoIB not re-joined | Restart opensm; bounce `ib0` or reboot the node |
+| IPoIB MTU stays 2044 after step 3, with no error | Partition still 2048: opensm not restarted, a standby SM took over with the old file, or IPoIB not re-joined | `saquery -g` (step 2); change every SM's partitions file, restart opensm; bounce `ib0` |
 | Mode stays `datagram` after option B | Enhanced IPoIB still active (mlx5) | Use option A, or set `ipoib_enhanced=0` on the module that offers it and rebuild initramfs |
 | Large IP packets dropped, small ones fine | IPoIB MTU differs between hosts | Same MTU on every host in the subnet |
 | High *nfsd arrivals that found no idle thread* | Too few threads for the load | Raise threads by half; re-run the multi-client capture |
