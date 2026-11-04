@@ -5,8 +5,8 @@ HTML + Markdown report.
     python3 nfs_report.py results/baseline results/rdma -o nfs-report.html
 
 The first directory is the reference; every later run gets a "% change vs
-<first>" column. Works with Python 3.6+ (Springdale/RHEL 8 platform python),
-standard library only.
+<first>" column. Works with Python 3.6+ (the python3 on EL7-EL10 and
+Ubuntu 24.04/26.04), standard library only.
 """
 import argparse
 import datetime
@@ -149,7 +149,10 @@ def parse_pool_stats(path):
 def nfsd_queue_pct(before, after):
     """% of arrivals that found no idle nfsd thread: (arrived - woken) / arrived.
 
-    sockets-enqueued is not used: on EL8 kernels it equals packets-arrived.
+    sockets-enqueued is not used: since EL8's 4.18 kernel it counts every
+    enqueue (equal to, or above, packets-arrived), not only those that waited.
+    threads-woken counts only wake-ups of a sleeping idle thread on every
+    kernel from EL7's 3.10 to current upstream, so this works on all of them.
     """
     if not before or not after:
         return None
@@ -337,11 +340,15 @@ def build_rows(runs):
     # Configuration
     cfg = [
         ("server", "os", "Server OS"), ("server", "kernel", "Server kernel"),
+        ("server", "platform", "Server platform"),
         ("server", "cpu_model", "Server CPU"), ("server", "cpu_sockets", "Server sockets"),
         ("server", "cpu_logical", "Server logical CPUs"), ("server", "mem_gib", "Server RAM (GiB)"),
+        ("server", "storage", "Exported filesystems"),
         ("server", "arc_max_gib", "ZFS ARC max (GiB)"), ("server", "zfs_version", "ZFS version"),
         ("server", "nfsd_threads", "nfsd threads"), ("server", "nfsd_listeners", "nfsd listeners"),
         ("server", "sunrpc_pool_mode", "sunrpc pool_mode"),
+        ("server", "hca", "Server HCA (type, firmware)"), ("server", "ib_driver", "Server HCA driver"),
+        ("server", "pcie_link", "Server HCA PCIe link"), ("server", "ib_rate", "Server IB link rate"),
         ("server", "ib_active_mtu", "Server IB active MTU"),
         ("server", "ipoib_mode", "Server IPoIB mode"), ("server", "ipoib_mtu", "Server IPoIB MTU"),
         ("client", "ib_active_mtu", "Client IB active MTU"),
@@ -350,6 +357,8 @@ def build_rows(runs):
     ]
     rows = [{"name": label, "vals": [g(r, "env", role, key) or "—" for r in runs],
              "text": True} for role, key, label in cfg]
+    # Drop rows that are empty for every run (e.g. ZFS rows on a non-ZFS server)
+    rows = [r for r in rows if any(v != "—" for v in r["vals"])]
     rows.insert(0, {"name": "NFS transport (from mountstats)",
                     "vals": [r.get("xprt") or "—" for r in runs], "text": True})
     rows.insert(1, {"name": "Client hosts in run",
@@ -371,9 +380,13 @@ def build_rows(runs):
         {"name": "RDMA read latency, typical (ib_read_lat)", "unit": "µs", "nd": 2,
          "better": "down", "vals": [g(r, "fabric", "ib_read_lat", "typical_us") for r in runs]},
     ]
+    rate = next((g(r, "env", "server", "ib_rate") or g(r, "env", "client", "ib_rate")
+                 for r in runs if g(r, "env", "server", "ib_rate") or g(r, "env", "client", "ib_rate")),
+                None)
     sections.append(("Fabric ceiling",
-                     "Raw network capability, independent of NFS and ZFS. EDR line rate is "
-                     "100 Gb/s; NFS cannot exceed what these show.", rows))
+                     "Raw network capability, independent of NFS and the storage. "
+                     + ("Link rate: {}. ".format(rate) if rate else "")
+                     + "NFS cannot exceed what these show.", rows))
 
     # Per-test
     tests = [t for t in TEST_ORDER if any(t in r["fio"] for r in runs)]

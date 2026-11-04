@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
 # nfs-rdma-preflight.sh — read-only dry run of the NFS-over-RDMA migration on a NAS.
 #
-# Changes nothing: no modprobe, no config edits, no service restarts, no nmcli
-# changes, no exportfs. It reads the current state, flags blockers, works out
-# the values for this host, and prints the exact commands for each step, split
-# into what can be done live and what needs the maintenance window.
+# Changes nothing: no modprobe, no config edits, no service restarts, no network
+# changes, no exportfs. It discovers the host (distribution, platform, CPU,
+# storage behind the exports, HCA model, driver and PCIe slot, IPoIB and the tool
+# that configures it, NFS config style), flags blockers, works out the values for
+# this host, and prints the exact commands for each step, split into what can be
+# done live and what needs the maintenance window.
+#
+# Supported: EL7, EL8, EL9, EL10 (RHEL, Rocky, Alma, Springdale, CentOS) and
+# Ubuntu Server 24.04 / 26.04. Other systemd distributions get the same checks
+# with an "untested" warning.
 #
 # Writes only:  $OUT/preflight-<host>-<timestamp>/
-#                 report.txt          everything printed to the screen
-#                 nfs.conf.orig       copy of the current /etc/nfs.conf
-#                 nfs.conf.proposed   the edited version the plan installs
-#                 nfs-clients.txt     hosts currently connected over TCP 2049
+#                 report.txt                  everything printed to the screen
+#                 nfs.conf.orig / .proposed   current and planned /etc/nfs.conf
+#                   (EL7: sysconfig-nfs.orig / .proposed for /etc/sysconfig/nfs)
+#                 nfs-clients.txt             hosts currently connected over TCP 2049
 #
 # Usage:  ./nfs-rdma-preflight.sh [sample_seconds]
 #   sample_seconds  seconds to sample nfsd thread pressure (default 30, 0 = skip)
@@ -19,18 +25,19 @@
 #   OUT=/root/nfs-tuning   TARGET_IB_MTU=4096   RDMA_PORT=20049
 #   THREADS=               override the computed nfsd thread count
 #   IPOIB_IF=              IPoIB interface (default: first one found)
-#   NFS_CONF=/etc/nfs.conf   NFSD_PROC=/proc/fs/nfsd   (only for testing)
-#
-# Works on EL8 (Springdale/Rocky/RHEL 8) and EL9.
+#   Testing only: NFS_CONF=/etc/nfs.conf  SYSCONFIG_NFS=/etc/sysconfig/nfs
+#                 NFSD_PROC=/proc/fs/nfsd  NFS_STYLE=nfsconf|sysconfig
 
 set -uo pipefail
 export LC_ALL=C
 
 SAMPLE=${1:-30}
+[[ $SAMPLE =~ ^[0-9]+$ ]] || { echo "usage: $0 [sample_seconds]" >&2; exit 1; }
 OUT=${OUT:-/root/nfs-tuning}
 TARGET_IB_MTU=${TARGET_IB_MTU:-4096}
 RDMA_PORT=${RDMA_PORT:-20049}
 NFS_CONF=${NFS_CONF:-/etc/nfs.conf}
+SYSCONFIG_NFS=${SYSCONFIG_NFS:-/etc/sysconfig/nfs}
 NFSD_PROC=${NFSD_PROC:-/proc/fs/nfsd}
 HOST=$(hostname -s)
 DIR="$OUT/preflight-$HOST-$(date +%Y%m%d-%H%M%S)"
@@ -38,26 +45,59 @@ mkdir -p "$DIR" || { echo "cannot create $DIR" >&2; exit 1; }
 exec > >(tee "$DIR/report.txt") 2>&1
 
 NPASS=0 NWARN=0 NFAIL=0
-LIVE=() WINDOW=() VERIFY=()
-pass()   { printf '  [ OK ] %s\n' "$*"; NPASS=$((NPASS + 1)); }
-warn()   { printf '  [WARN] %s\n' "$*"; NWARN=$((NWARN + 1)); }
-fail()   { printf '  [FAIL] %s\n' "$*"; NFAIL=$((NFAIL + 1)); }
-info()   { printf '  [info] %s\n' "$*"; }
-head1()  { printf '\n== %s ==\n' "$*"; }
-have()   { command -v "$1" >/dev/null 2>&1; }
-live()   { LIVE+=("$1"); }
-window() { WINDOW+=("$1"); }
-verify() { VERIFY+=("$1"); }
+LIVE=() WINDOW=() VERIFY=() PROFILE=()
+pass()    { printf '  [ OK ] %s\n' "$*"; NPASS=$((NPASS + 1)); }
+warn()    { printf '  [WARN] %s\n' "$*"; NWARN=$((NWARN + 1)); }
+fail()    { printf '  [FAIL] %s\n' "$*"; NFAIL=$((NFAIL + 1)); }
+info()    { printf '  [info] %s\n' "$*"; }
+head1()   { printf '\n== %s ==\n' "$*"; }
+have()    { command -v "$1" >/dev/null 2>&1; }
+live()    { LIVE+=("$1"); }
+window()  { WINDOW+=("$1"); }
+verify()  { VERIFY+=("$1"); }
+profile() { PROFILE+=("$(printf '%-9s %s' "$1:" "$2")"); }
 mtu_code() { case $1 in 256) echo 1;; 512) echo 2;; 1024) echo 3;; 2048) echo 4;; 4096) echo 5;; *) echo "";; esac; }
+rd()      { local v; { read -r v < "$1"; } 2>/dev/null && printf '%s' "$v"; }   # first line of a sysfs file
+modfile() {   # modfile <kernel> <module>: module file or builtin entry exists
+  find "/lib/modules/$1" \( -name "$2.ko" -o -name "$2.ko.*" \) 2>/dev/null | grep -q . ||
+    grep -qs "/$2.ko\$" "/lib/modules/$1/modules.builtin"
+}
 
 echo "NFS over RDMA preflight (read-only) — $HOST — $(date '+%Y-%m-%d %H:%M %Z')"
 echo "Report directory: $DIR"
 
 # ------------------------------------------------------------------ host
 head1 "Host"
-OSNAME=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown OS}")
-info "$OSNAME, kernel $(uname -r)"
-[[ $EUID -eq 0 ]] || warn "not running as root: subnet manager, export and firewall checks will be incomplete"
+OS_ID="" OS_LIKE="" OS_VER="" OSNAME="unknown OS"
+if [[ -r /etc/os-release ]]; then
+  eval "$(. /etc/os-release; printf 'OS_ID=%q OS_LIKE=%q OS_VER=%q OSNAME=%q' \
+          "${ID:-}" "${ID_LIKE:-}" "${VERSION_ID:-}" "${PRETTY_NAME:-unknown OS}")"
+fi
+case " $OS_ID $OS_LIKE " in
+  *" ubuntu "*|*" debian "*)            FAMILY=deb ;;
+  *" rhel "*|*" centos "*|*" fedora "*) FAMILY=el ;;
+  *)                                    FAMILY=other ;;
+esac
+MAJOR=${OS_VER%%.*}
+EL7=0; [[ $FAMILY == el && $MAJOR == 7 ]] && EL7=1
+case $FAMILY in
+  el)  PKG=$([[ $EL7 == 1 ]] && echo yum || echo dnf)
+       [[ $MAJOR =~ ^(7|8|9|10)$ ]] && pass "$OSNAME (EL$MAJOR, supported)" \
+                                    || warn "$OSNAME: EL$MAJOR is untested; checks use EL defaults" ;;
+  deb) PKG=apt-get
+       [[ $OS_ID == ubuntu && $OS_VER =~ ^(24|26)\.04$ ]] && pass "$OSNAME (supported)" \
+                                    || warn "$OSNAME is untested; checks use Ubuntu defaults" ;;
+  *)   PKG="" ; warn "$OSNAME is untested; checks use generic paths" ;;
+esac
+info "kernel $(uname -r)"
+profile OS "$OSNAME, kernel $(uname -r)"
+[[ $EUID -eq 0 ]] || warn "not running as root: subnet manager, export, netplan and firewall checks will be incomplete"
+
+vendor=$(rd /sys/class/dmi/id/sys_vendor); product=$(rd /sys/class/dmi/id/product_name)
+bios=$(rd /sys/class/dmi/id/bios_version)
+info "platform: ${vendor:-?} ${product:-?}, BIOS ${bios:-?}"
+profile Platform "${vendor:-?} ${product:-?}"
+
 logical=$(nproc --all)
 lsc=$(lscpu 2>/dev/null)
 sockets=$(awk -F: '/^Socket\(s\)/{gsub(/ /,"",$2);print $2;exit}' <<<"$lsc")
@@ -65,58 +105,139 @@ cps=$(awk -F: '/^Core\(s\) per socket/{gsub(/ /,"",$2);print $2;exit}' <<<"$lsc"
 model=$(awk -F: '/^Model name/{sub(/^ +/,"",$2);print $2;exit}' <<<"$lsc")
 numa=$(awk -F: '/^NUMA node\(s\)/{gsub(/ /,"",$2);print $2;exit}' <<<"$lsc")
 physical=$(( ${sockets:-1} * ${cps:-1} ))
+ramgib=$(awk '/MemTotal/{printf "%.0f", $2/1048576}' /proc/meminfo)
 info "CPU: ${model:-?}; ${sockets:-?} socket(s), $physical cores, $logical logical CPUs, ${numa:-?} NUMA node(s)"
-info "RAM: $(awk '/MemTotal/{printf "%.0f GiB", $2/1048576}' /proc/meminfo)"
+info "RAM: $ramgib GiB"
+profile CPU "${sockets:-?} x ${model:-?}; $logical logical CPUs, ${numa:-?} NUMA node(s), $ramgib GiB RAM"
 
-# A reboot in the window boots the default kernel, which needs a ZFS module.
-bootk=""
-if have grubby; then bootk=$(grubby --default-kernel 2>/dev/null | sed 's|^/boot/vmlinuz-||'); fi
-if [[ -n $bootk ]]; then
-  if [[ $bootk == "$(uname -r)" ]]; then
-    pass "default boot kernel is the running kernel"
-  else
-    warn "default boot kernel is $bootk, not the running $(uname -r); a reboot in the window changes kernels"
-    if find "/lib/modules/$bootk" -name 'zfs.ko*' 2>/dev/null | grep -q .; then
-      pass "a ZFS module exists for $bootk"
-    else
-      fail "no zfs.ko for $bootk: the pool would not import after a reboot. Build ZFS for it, or keep the current kernel: grubby --set-default /boot/vmlinuz-$(uname -r)"
-    fi
-  fi
+# ------------------------------------------------------------------ storage
+head1 "Storage behind the exports"
+EXPORTS=""
+have exportfs && EXPORTS=$(exportfs -s 2>/dev/null)
+mapfile -t EXPORT_PATHS < <(awk 'NF{print $1}' <<<"$EXPORTS" | sort -u)
+uses_zfs=0
+backends=""
+if ((${#EXPORT_PATHS[@]})); then
+  backends=$(for p in "${EXPORT_PATHS[@]}"; do
+               findmnt -no FSTYPE,SOURCE -T "$p" 2>/dev/null | head -1
+             done | awk '{t = $1; s = $2; if (t == "zfs") sub(/\/.*/, "", s); print t, s}' | sort | uniq -c)
+  while read -r n t s; do
+    [[ -n $t ]] || continue
+    info "$n export(s) on $t ($s)"
+    [[ $t == zfs ]] && uses_zfs=1
+  done <<<"$backends"
+  profile Storage "$(awk '{printf "%s%s on %s", (NR > 1 ? "; " : ""), $2, $3}' <<<"$backends")"
+else
+  info "no exports listed (not root, or nothing exported); storage checks cover what is present"
 fi
 
-# ------------------------------------------------------------------ zfs
-head1 "ZFS"
-if have zpool; then
+if have zpool && [[ -n $(zpool list -H -o name 2>/dev/null) ]]; then
+  ((${#EXPORT_PATHS[@]})) || uses_zfs=1
   st=$(zpool status -x 2>&1)
-  if [[ $st == "all pools are healthy" ]]; then pass "all pools healthy"
-  else fail "pool status: $(head -3 <<<"$st" | tr '\n' ' ')— resolve or account for this before the window"; fi
+  if [[ $st == "all pools are healthy" ]]; then pass "ZFS: all pools healthy"
+  else fail "ZFS pool status: $(head -3 <<<"$st" | tr '\n' ' ')— resolve or account for this before the window"; fi
   while read -r n s a h; do [[ -n $n ]] && info "pool $n: size $s, allocated $a, $h"; done \
     < <(zpool list -H -o name,size,alloc,health 2>/dev/null)
-else
-  warn "zpool command not found"
+  info "ZFS $(rd /sys/module/zfs/version), ARC max $(awk '$1=="c_max"{printf "%.0f GiB", $3/1073741824}' /proc/spl/kstat/zfs/arcstats 2>/dev/null)"
+elif ((uses_zfs)); then
+  warn "exports are on ZFS but zpool is not available to this user"
 fi
+
+if grep -qs '^md' /proc/mdstat; then
+  deg=$(awk '/^md/{d = $1} /\[[U_]+\]$/{ if ($NF ~ /_/) print d }' /proc/mdstat | paste -sd' ')
+  [[ -n $deg ]] && fail "degraded md array(s): $deg — resolve before the window" \
+                || pass "md arrays healthy ($(grep -c '^md' /proc/mdstat))"
+fi
+
+if have lspci; then
+  while read -r c; do [[ -n $c ]] && info "storage controller: $c"; done \
+    < <(lspci 2>/dev/null | sed -n -E 's/^[0-9a-f:.]+ (RAID bus controller|Serial Attached SCSI controller): //p' | sort -u)
+fi
+for cli in perccli64 perccli storcli64 storcli; do
+  have "$cli" || continue
+  vds=$("$cli" /call/vall show 2>/dev/null | awk '$1 ~ /^[0-9]+\/[0-9]+$/ {print $1, $2, $3}')
+  if [[ -n $vds ]]; then
+    bad=$(awk '$3 != "Optl"' <<<"$vds")
+    [[ -n $bad ]] && fail "RAID virtual drive(s) not optimal ($cli): $(paste -sd';' <<<"$bad")" \
+                  || pass "RAID virtual drives optimal ($(wc -l <<<"$vds"), $cli)"
+  fi
+  break
+done
 
 # ------------------------------------------------------------------ packages
 head1 "Packages"
 missing=()
-if have rpm; then
-  for p in rdma-core nfs-utils infiniband-diags libibverbs-utils perftest; do
-    if rpm -q "$p" >/dev/null 2>&1; then pass "$p $(rpm -q --qf '%{VERSION}-%{RELEASE}' "$p")"
-    else warn "$p not installed"; missing+=("$p"); fi
-  done
-  ((${#missing[@]})) && live "Install missing packages (no service impact)
-    dnf install -y ${missing[*]}"
-fi
+case $FAMILY in
+  el)  pkgs=(rdma-core nfs-utils infiniband-diags libibverbs-utils perftest) ;;
+  deb) pkgs=(rdma-core nfs-kernel-server infiniband-diags ibverbs-utils perftest) ;;
+  *)   pkgs=() ; info "unknown package manager: check rdma-core, NFS server, infiniband-diags, ibverbs utilities and perftest by hand" ;;
+esac
+for p in "${pkgs[@]}"; do
+  if [[ $FAMILY == el ]] && rpm -q "$p" >/dev/null 2>&1; then
+    pass "$p $(rpm -q --qf '%{VERSION}-%{RELEASE}' "$p")"
+  elif [[ $FAMILY == deb ]] && dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'ok installed'; then
+    pass "$p $(dpkg-query -W -f='${Version}' "$p")"
+  else
+    warn "$p not installed"; missing+=("$p")
+  fi
+done
+((${#missing[@]})) && live "Install missing packages (no service impact)
+    $PKG install -y ${missing[*]}"
 have ofed_info && info "vendor OFED installed: $(ofed_info -s 2>/dev/null) — NFS/RDMA modules must come from it"
 
+# ------------------------------------------------------------------ hca / pcie
+head1 "HCA and PCIe slot"
+declare -A HCA_NAME=([0x1003]="ConnectX-3" [0x1007]="ConnectX-3 Pro" [0x1011]="Connect-IB"
+  [0x1013]="ConnectX-4" [0x1015]="ConnectX-4 Lx" [0x1017]="ConnectX-5" [0x1019]="ConnectX-5 Ex"
+  [0x101b]="ConnectX-6" [0x101d]="ConnectX-6 Dx" [0x101f]="ConnectX-6 Lx" [0x1021]="ConnectX-7"
+  [0x1023]="ConnectX-8")
+declare -A PCIE_GBPS=() IBDEV_DRV=() IBDEV_HCA=()
+IB_MODS=()
+nhca=0
+for d in /sys/bus/pci/devices/*; do
+  [[ $(rd "$d/vendor") == 0x15b3 ]] || continue
+  cls=$(rd "$d/class"); [[ $cls == 0x0207* || $cls == 0x0200* ]] || continue
+  [[ -e $d/physfn ]] && continue                       # SR-IOV virtual function
+  nhca=$((nhca + 1))
+  pci=${d##*/}; devid=$(rd "$d/device"); name=${HCA_NAME[$devid]:-"Mellanox device $devid"}
+  drv=""; [[ -L $d/driver ]] && drv=$(basename "$(readlink "$d/driver")")
+  ibd=$(ls "$d/infiniband" 2>/dev/null | head -1)
+  fw=""; [[ -n $ibd ]] && fw=$(rd "/sys/class/infiniband/$ibd/fw_ver")
+  info "$pci $name: driver ${drv:-none}, RDMA device ${ibd:-none}, firmware ${fw:-?}, NUMA node $(rd "$d/numa_node")"
+  if [[ -z $drv ]]; then
+    if [[ $FAMILY == el && $MAJOR -ge 10 && ( $devid == 0x1003 || $devid == 0x1007 ) ]]; then
+      fail "$pci $name has no driver: EL10 removed mlx4 (ConnectX-3). Use EL9 or older, Ubuntu, or a ConnectX-4 or newer HCA"
+    else
+      fail "$pci $name has no driver bound"
+    fi
+    continue
+  fi
+  case $drv in mlx5_core) IB_MODS+=(mlx5_ib) ;; mlx4_core) IB_MODS+=(mlx4_ib) ;; esac
+  [[ -n $ibd ]] && { IBDEV_DRV[$ibd]=$drv; IBDEV_HCA[$ibd]=$name; }
+  cs=$(rd "$d/current_link_speed"); cw=$(rd "$d/current_link_width")
+  ms=$(rd "$d/max_link_speed");     mw=$(rd "$d/max_link_width")
+  if [[ -n $cs && -n $cw ]]; then
+    gbps=$(awk -v s="${cs%% *}" -v w="$cw" 'BEGIN { printf "%.0f", s * w * (s >= 8 ? 128 / 130 : 0.8) }')
+    [[ -n $ibd ]] && PCIE_GBPS[$ibd]=$gbps
+    if [[ ${cw:-0} -lt ${mw:-0} || ${cs%% *} != "${ms%% *}" ]]; then
+      warn "$pci runs at PCIe ${cs%% *} GT/s x$cw (about $gbps Gb/s); the card supports ${ms%% *} GT/s x$mw — reseat it or move it to a full-width slot"
+    else
+      info "$pci PCIe ${cs%% *} GT/s x$cw, about $gbps Gb/s usable"
+    fi
+  fi
+done
+((nhca)) || fail "no Mellanox/NVIDIA HCA found on the PCI bus"
+mapfile -t IB_MODS < <(printf '%s\n' "${IB_MODS[@]}" | sort -u | sed '/^$/d')
+
 # ------------------------------------------------------------------ infiniband
-head1 "InfiniBand"
+head1 "InfiniBand ports"
 ipoib=()
-for n in /sys/class/net/*; do [[ $(cat "$n/type" 2>/dev/null) == 32 ]] && ipoib+=("${n##*/}"); done
+for n in /sys/class/net/*; do [[ $(rd "$n/type") == 32 ]] && ipoib+=("${n##*/}"); done
 IF=${IPOIB_IF:-${ipoib[0]:-}}
+((${#ipoib[@]} > 1)) && [[ -z ${IPOIB_IF:-} ]] && info "IPoIB interfaces: ${ipoib[*]}; using $IF (set IPOIB_IF= to choose)"
 ibdev=""
 [[ -n $IF ]] && ibdev=$(ls "/sys/class/net/$IF/device/infiniband" 2>/dev/null | head -1)
-cur_mtu=""
+cur_mtu="" ib_rate=""
 ndev=0
 for d in /sys/class/infiniband/*; do
   [[ -e $d ]] || continue
@@ -124,7 +245,7 @@ for d in /sys/class/infiniband/*; do
   for p in "$d"/ports/*; do
     [[ -e $p ]] || continue
     ndev=$((ndev + 1)); port=${p##*/}
-    ll=$(cat "$p/link_layer" 2>/dev/null); state=$(cat "$p/state" 2>/dev/null); rate=$(cat "$p/rate" 2>/dev/null)
+    ll=$(rd "$p/link_layer"); state=$(rd "$p/state"); rate=$(rd "$p/rate")
     dvi=$(ibv_devinfo -d "$dev" -i "$port" 2>/dev/null)
     amtu=$(awk '/active_mtu/{print $2;exit}' <<<"$dvi"); mmtu=$(awk '/max_mtu/{print $2;exit}' <<<"$dvi")
     tag=""; [[ $dev == "$ibdev" ]] && tag=" (carries $IF)"
@@ -134,8 +255,14 @@ for d in /sys/class/infiniband/*; do
     else fail "$dev port $port link layer is $ll; set LINK_TYPE_P$port=1 with mstconfig and reboot"; fi
     [[ $state == *ACTIVE* ]] && pass "$dev port $port is ACTIVE" || fail "$dev port $port is not ACTIVE ($state)"
     cur_mtu=${amtu:-$cur_mtu}
-    if [[ -n $mmtu && $mmtu -lt $TARGET_IB_MTU ]]; then
-      fail "$dev max MTU $mmtu is below the $TARGET_IB_MTU target"
+    [[ -n $mmtu && $mmtu -lt $TARGET_IB_MTU ]] && fail "$dev max MTU $mmtu is below the $TARGET_IB_MTU target"
+    r=${rate%% *}
+    if [[ $state == *ACTIVE* && $r =~ ^[0-9.]+$ ]]; then
+      ib_rate=${ib_rate:-$rate}
+      pg=${PCIE_GBPS[$dev]:-}
+      if [[ -n $pg ]] && awk -v p="$pg" -v r="$r" 'BEGIN { exit !(p < 0.95 * r) }'; then
+        warn "$dev: the PCIe slot gives about $pg Gb/s, below the $r Gb/s link; NFS/RDMA throughput tops out near $pg Gb/s"
+      fi
     fi
   done
 done
@@ -144,6 +271,8 @@ if [[ -n $cur_mtu ]]; then
   if [[ $cur_mtu -ge $TARGET_IB_MTU ]]; then pass "IB link MTU already $cur_mtu"
   else warn "IB link MTU is $cur_mtu; target $TARGET_IB_MTU is set at the subnet manager (see below)"; fi
 fi
+hdev=${ibdev:-$(ls /sys/class/infiniband 2>/dev/null | head -1)}; hdev=${hdev:-none}
+profile HCA "${IBDEV_HCA[$hdev]:-?} ($hdev, ${IBDEV_DRV[$hdev]:-?}), ${ib_rate:-link down}, IB MTU ${cur_mtu:-?}"
 
 # ------------------------------------------------------------------ subnet manager
 head1 "Subnet manager"
@@ -166,7 +295,9 @@ if systemctl is-active -q opensm 2>/dev/null; then
   for c in /etc/rdma/opensm.conf /etc/opensm/opensm.conf; do
     [[ -r $c ]] && pf=$(awk '$1=="partition_config_file"{print $2;exit}' "$c") && [[ -n $pf ]] && break
   done
-  pf=${pf:-/etc/rdma/partitions.conf}
+  if [[ -z $pf ]]; then
+    [[ $FAMILY == deb ]] && pf=/etc/opensm/partitions.conf || pf=/etc/rdma/partitions.conf
+  fi
   info "opensm runs on this host; partition file: $pf"
   if [[ -r $pf ]]; then
     defl=$(grep -E '^[[:space:]]*Default[[:space:]]*=' "$pf" | head -1)
@@ -198,87 +329,199 @@ fi
 # ------------------------------------------------------------------ ipoib
 head1 "IPoIB${IF:+ ($IF)}"
 addr=""
-con=""
 if [[ -z $IF ]]; then
   fail "no IPoIB interface found"
+  profile IPoIB "none"
 else
-  mode=$(cat "/sys/class/net/$IF/mode" 2>/dev/null)
-  mtu=$(cat "/sys/class/net/$IF/mtu" 2>/dev/null)
+  mode=$(rd "/sys/class/net/$IF/mode"); mtu=$(rd "/sys/class/net/$IF/mtu")
   addr=$(ip -4 -o addr show dev "$IF" 2>/dev/null | awk '{print $4; exit}')
   info "mode ${mode:-?}, MTU ${mtu:-?}, address ${addr:-none}"
   [[ -n $addr ]] && pass "IPoIB has an address (RDMA mounts resolve the server through it)" \
                  || fail "$IF has no IPv4 address; NFS/RDMA needs one to resolve the server"
+
+  # Which tool owns the interface: netplan > NetworkManager > ifcfg > systemd-networkd
+  netcfg="" np_file="" con="" nd_file=""
+  for f in /etc/netplan/*.yaml; do
+    [[ -r $f ]] && grep -Eq "^[[:space:]]+$IF:" "$f" && { np_file=$f; break; }
+  done
   if have nmcli; then
-    con=$(nmcli -g GENERAL.CONNECTION device show "$IF" 2>/dev/null)
-    [[ $con == "--" ]] && con=""
+    con=$(nmcli -g GENERAL.CONNECTION device show "$IF" 2>/dev/null); [[ $con == "--" ]] && con=""
   fi
-  if [[ -n $con ]]; then info "NetworkManager connection: \"$con\""
-  elif [[ -r /etc/sysconfig/network-scripts/ifcfg-$IF ]]; then info "configured by ifcfg-$IF"
+  for f in /etc/systemd/network/*.network; do
+    [[ -r $f ]] && grep -Eq "^[[:space:]]*Name=.*\b$IF\b" "$f" && { nd_file=$f; break; }
+  done
+  if   [[ -n $np_file ]]; then netcfg=netplan;  info "configured by netplan: $np_file"
+  elif [[ -n $con ]];     then netcfg=nm;       info "NetworkManager connection: \"$con\""
+  elif [[ -r /etc/sysconfig/network-scripts/ifcfg-$IF ]]; then netcfg=ifcfg; info "configured by ifcfg-$IF"
+  elif [[ -n $nd_file ]]; then netcfg=networkd; info "configured by systemd-networkd: $nd_file"
+  else netcfg=unknown; warn "could not tell which tool configures $IF (netplan/NetworkManager/ifcfg/networkd)"
+       [[ $FAMILY == deb && $EUID -ne 0 ]] && info "netplan files are readable only by root"
   fi
-  enh=""
-  for m in ib_ipoib mlx5_ib; do modinfo -F parm "$m" 2>/dev/null | grep -q '^ipoib_enhanced' && enh=$m; done
-  if [[ -n $enh ]]; then info "connected mode is possible via '$enh ipoib_enhanced=0' (gives up Enhanced IPoIB offloads)"
-  else info "driver has no ipoib_enhanced parameter: datagram mode only (runbook option A)"; fi
+  profile IPoIB "$IF ${mode:-?} MTU ${mtu:-?}, managed by $netcfg"
+
+  drv=${IBDEV_DRV[${ibdev:-none}]:-}
+  case $drv in
+    mlx4_core) info "ConnectX-3 (mlx4): no Enhanced IPoIB, so connected mode (MTU 65520) is available; datagram 4092 stays the recommendation for a uniform subnet" ;;
+    mlx5_core)
+      enh=""
+      for m in ib_ipoib mlx5_ib; do modinfo -F parm "$m" 2>/dev/null | grep -q '^ipoib_enhanced' && enh=$m; done
+      if [[ -n $enh ]]; then info "mlx5 Enhanced IPoIB; connected mode possible via '$enh ipoib_enhanced=0' (gives up its offloads)"
+      else info "mlx5 Enhanced IPoIB: datagram mode only (runbook option A)"; fi ;;
+  esac
+
   tgt=$((TARGET_IB_MTU - 4))
   if [[ $mode == datagram && ${mtu:-0} -lt $tgt ]]; then
-    if [[ -n $con ]]; then cmd="nmcli con mod \"$con\" infiniband.transport-mode datagram infiniband.mtu $tgt
-    nmcli con up \"$con\""
-    else cmd="set MTU=$tgt in /etc/sysconfig/network-scripts/ifcfg-$IF, then: ifdown $IF; ifup $IF"; fi
+    case $netcfg in
+      netplan)  cmd="# in $np_file, under $IF: set  mtu: $tgt  (and  infiniband-mode: datagram)
+    netplan try                     # reverts after 120 s unless confirmed" ;;
+      nm)       cmd="nmcli con mod \"$con\" infiniband.transport-mode datagram infiniband.mtu $tgt
+    nmcli con up \"$con\"" ;;
+      ifcfg)    cmd="set MTU=$tgt in /etc/sysconfig/network-scripts/ifcfg-$IF, then: ifdown $IF; ifup $IF" ;;
+      networkd) cmd="set MTUBytes=$tgt under [Link] in $nd_file, then: networkctl reload; networkctl reconfigure $IF" ;;
+      *)        cmd="ip link set $IF mtu $tgt    # and persist it in whatever configures $IF" ;;
+    esac
     window "After the SM change: IPoIB MTU $tgt on this host (brief IPoIB drop), and the same on EVERY host in the IPoIB subnet
     $cmd
     cat /sys/class/net/$IF/mtu      # expect $tgt"
   fi
 fi
 
+# ------------------------------------------------------------------ reboot safety
+head1 "Reboot safety"
+bootk=""
+if have grubby; then bootk=$(grubby --default-kernel 2>/dev/null | sed 's|^/boot/vmlinuz-||')
+elif [[ -e /boot/vmlinuz ]]; then bootk=$(readlink -f /boot/vmlinuz | sed 's|^/boot/vmlinuz-||'); fi
+need=()
+((uses_zfs)) && need+=(zfs)
+need+=("${IB_MODS[@]}" ib_ipoib)
+if [[ -z $bootk ]]; then
+  info "could not determine the default boot kernel"
+elif [[ $bootk == "$(uname -r)" ]]; then
+  pass "default boot kernel is the running kernel"
+else
+  warn "default boot kernel is $bootk, not the running $(uname -r); a reboot in the window changes kernels"
+  rpc=rpcrdma; modfile "$bootk" rpcrdma || { modfile "$bootk" svcrdma && rpc=svcrdma; }
+  for m in "${need[@]}" "$rpc"; do
+    if modfile "$bootk" "$m"; then pass "$m module present for $bootk"
+    else
+      case $m in
+        zfs) hint="build ZFS for it (dkms status), or keep the current kernel" ;;
+        *)   hint=$([[ $FAMILY == deb ]] && echo "apt-get install linux-modules-extra-$bootk, or keep the current kernel" || echo "keep the current kernel") ;;
+      esac
+      setk=$([[ $FAMILY == el ]] && echo "grubby --set-default /boot/vmlinuz-$(uname -r)" || echo "set GRUB_DEFAULT to $(uname -r)")
+      fail "no $m module for $bootk: $hint ($setk)"
+    fi
+  done
+fi
+
 # ------------------------------------------------------------------ rdma modules
 head1 "NFS/RDMA kernel support"
-if modinfo rpcrdma >/dev/null 2>&1; then pass "rpcrdma module available ($(modinfo -F filename rpcrdma 2>/dev/null))"
-else fail "rpcrdma module not found: this kernel/OFED build has no NFS over RDMA"; fi
-if lsmod 2>/dev/null | grep -q '^rpcrdma'; then pass "rpcrdma loaded"
-else info "rpcrdma not loaded yet"; fi
-rc=/etc/rdma/modules/rdma.conf
-if grep -Eq '^[[:space:]]*svcrdma' "$rc" 2>/dev/null; then pass "svcrdma enabled in $rc (loads at boot)"
-else warn "svcrdma not enabled in $rc"
-     live "Load svcrdma at boot (no impact)
-    echo svcrdma >> $rc"; fi
+if modinfo rpcrdma >/dev/null 2>&1 || modinfo svcrdma >/dev/null 2>&1; then
+  pass "NFS/RDMA module available ($(modinfo -F filename svcrdma 2>/dev/null || modinfo -F filename rpcrdma 2>/dev/null))"
+else
+  hint=""; [[ $FAMILY == deb ]] && hint=" — try: apt-get install linux-modules-extra-$(uname -r)"
+  fail "no rpcrdma/svcrdma module for $(uname -r): this kernel/OFED build has no NFS over RDMA$hint"
+fi
+lsmod 2>/dev/null | grep -Eq '^(rpcrdma|svcrdma)' && pass "NFS/RDMA module loaded" || info "NFS/RDMA module not loaded yet"
+if ((EL7)); then
+  if grep -Eqs '^[[:space:]]*SVCRDMA_LOAD=yes' /etc/rdma/rdma.conf; then pass "SVCRDMA_LOAD=yes in /etc/rdma/rdma.conf (loads at boot)"
+  else warn "svcrdma is not loaded at boot"
+       live "Load svcrdma at boot (no impact)
+    grep -q '^SVCRDMA_LOAD=' /etc/rdma/rdma.conf && sed -i 's/^SVCRDMA_LOAD=.*/SVCRDMA_LOAD=yes/' /etc/rdma/rdma.conf || echo SVCRDMA_LOAD=yes >> /etc/rdma/rdma.conf"
+  fi
+elif grep -Eqs '^[[:space:]]*svcrdma' /etc/rdma/modules/*.conf /etc/modules-load.d/*.conf /etc/modules; then
+  pass "svcrdma listed for loading at boot"
+else
+  warn "svcrdma is not loaded at boot"
+  live "Load svcrdma at boot (no impact)
+    echo svcrdma > /etc/modules-load.d/nfs-rdma.conf"
+fi
 
 # ------------------------------------------------------------------ nfs server
 head1 "NFS server"
 systemctl is-active -q nfs-server 2>/dev/null && pass "nfs-server active" || warn "nfs-server not active"
-threads=$(cat "$NFSD_PROC/threads" 2>/dev/null)
+threads=$(rd "$NFSD_PROC/threads")
 portlist=$(paste -sd',' "$NFSD_PROC/portlist" 2>/dev/null)
-info "threads: ${threads:-?}; listeners: ${portlist:-?}; versions: $(cat "$NFSD_PROC/versions" 2>/dev/null)"
-info "sunrpc pool_mode: $(cat /sys/module/sunrpc/parameters/pool_mode 2>/dev/null || echo '?')"
+vers=$(rd "$NFSD_PROC/versions")
+info "threads: ${threads:-?}; listeners: ${portlist:-?}; versions: ${vers:-?}"
+info "sunrpc pool_mode: $(rd /sys/module/sunrpc/parameters/pool_mode || echo '?')"
+
+# Clients mount vers=4.2. Enabling it needs nfsd stopped, so it is a window step.
+need42=0
+if [[ -z $vers ]]; then
+  info "cannot read $NFSD_PROC/versions"
+elif [[ " $vers " == *" +4.2 "* ]]; then
+  pass "server offers NFSv4.2"
+elif [[ " $vers " == *" -4.2 "* ]]; then
+  fail "NFSv4.2 is disabled on the server; clients mount vers=4.2 (the plan enables it)"
+  need42=1
+else
+  fail "this kernel's nfsd has no NFSv4.2; clients mount vers=4.2 — update the kernel first"
+fi
+
 ceil16=$(( (logical + 15) / 16 * 16 ))
 T=$(( ceil16 > 64 ? ceil16 : 64 ))
-T=${THREADS:-$T}
-info "planned nfsd threads: $T (max(64, $logical logical CPUs rounded up to 16); override with THREADS=)"
+if [[ -n ${THREADS:-} ]]; then
+  T=$THREADS; info "planned nfsd threads: $T (THREADS= override)"
+elif [[ ${threads:-0} -gt $T ]]; then
+  info "planned nfsd threads: keep $threads (already above max(64, $logical logical CPUs rounded up to 16) = $T)"
+  T=$threads
+else
+  info "planned nfsd threads: $T (max(64, $logical logical CPUs rounded up to 16); override with THREADS=)"
+fi
 
-live "Load the RDMA server transport and add the RDMA listener to the running server (TCP clients unaffected)
+if [[ " ${portlist//,/ } " == *"rdma $RDMA_PORT"* ]]; then
+  pass "RDMA listener already on port $RDMA_PORT"
+else
+  live "Load the RDMA server transport and add the RDMA listener to the running server (TCP clients unaffected)
     modprobe svcrdma
-    grep -q 'rdma $RDMA_PORT' $NFSD_PROC/portlist || echo 'rdma $RDMA_PORT' > $NFSD_PROC/portlist
+    echo 'rdma $RDMA_PORT' > $NFSD_PROC/portlist
     cat $NFSD_PROC/portlist          # expect rdma $RDMA_PORT alongside tcp 2049"
-grep -q "rdma $RDMA_PORT" "$NFSD_PROC/portlist" 2>/dev/null && pass "RDMA listener already on port $RDMA_PORT"
-
+fi
 if [[ ${threads:-0} -lt $T ]]; then
   live "Raise nfsd threads on the running server (immediate, no restart)
     echo $T > $NFSD_PROC/threads
     cat $NFSD_PROC/threads"
 fi
 
-if grep -qs '^[[:space:]]*RPCNFSDCOUNT' /etc/sysconfig/nfs; then
-  warn "/etc/sysconfig/nfs sets $(grep -m1 '^[[:space:]]*RPCNFSDCOUNT' /etc/sysconfig/nfs); EL8 reads /etc/nfs.conf — remove it so the two can't disagree"
-fi
+# Persistent config: nfs.conf where nfs-utils has nfsconf (EL8+, Ubuntu), /etc/sysconfig/nfs on EL7
+if [[ -n ${NFS_STYLE:-} ]]; then style=$NFS_STYLE
+elif have nfsconf; then style=nfsconf
+elif [[ -e $SYSCONFIG_NFS ]]; then style=sysconfig
+else style=nfsconf; fi
+if [[ $style == sysconfig ]]; then CFG=$SYSCONFIG_NFS; TAG=sysconfig-nfs; else CFG=$NFS_CONF; TAG=nfs.conf; fi
+profile NFS "nfsd ${threads:-?} threads, ${vers:-?}; config in $CFG"
+ORIG="$DIR/$TAG.orig" PROP="$DIR/$TAG.proposed"
+if [[ -s $CFG ]]; then cp -a "$CFG" "$ORIG"; else : > "$ORIG"; info "$CFG missing or empty; proposing a minimal one"; fi
 
-# nfs.conf: current [nfsd] settings and the proposed file
-if [[ -s $NFS_CONF ]]; then
-  cp -a "$NFS_CONF" "$DIR/nfs.conf.orig"
-  info "active [nfsd] lines in $NFS_CONF:"
+if [[ $style == sysconfig ]]; then
+  info "active settings in $CFG:"
+  grep -E '^[[:space:]]*RPCNFSD' "$ORIG" | sed 's/^/           /'
+  awk -v T="$T" -v P="$RDMA_PORT" -v V42="$need42" '
+    function addtok(s, t) { return index(" " s " ", " " t " ") ? s : (s == "" ? t : s " " t) }
+    function args(v) {
+      if (v !~ /--rdma/ && v !~ /(^| )-r( |$)/) v = addtok(v, "--rdma=" P)
+      if (V42) { gsub(/-N[[:space:]]*4\.2/, "", v); gsub(/  +/, " ", v); sub(/^ /, "", v)
+                 if (v !~ /-V[[:space:]]*4\.2/) v = addtok(v, "-V 4.2") }
+      return "RPCNFSDARGS=\"" v "\"" }
+    /^[[:space:]]*RPCNFSDCOUNT[[:space:]]*=/ { if (!c++) print "RPCNFSDCOUNT=" T; next }
+    /^[[:space:]]*RPCNFSDARGS[[:space:]]*=/ { v = $0; sub(/^[^=]*=[[:space:]]*/, "", v)
+                                            gsub(/^["\047]|["\047][[:space:]]*$/, "", v)
+                                            if (!a++) print args(v); next }
+    { print }
+    END { if (!c) print "RPCNFSDCOUNT=" T; if (!a) print args("") }
+  ' "$ORIG" > "$PROP"
+  ok_parse=0
+  stage="cmp -s $CFG $ORIG && cp -a $CFG $CFG.pre-rdma && cp $PROP $CFG
+    systemctl restart nfs-config       # regenerates /run/sysconfig/nfs-utils; nfsd keeps running"
+  verify "grep RPCNFSD $CFG: RPCNFSDCOUNT=$T and --rdma=$RDMA_PORT in RPCNFSDARGS"
+else
+  info "active [nfsd] lines in $CFG:"
   awk '/^[[:space:]]*\[/{s=$0; gsub(/[][[:space:]]/,"",s); sec=tolower(s); next}
-       sec=="nfsd" && /^[[:space:]]*[A-Za-z][^=]*=/ {print "           " $0}' "$NFS_CONF"
-  awk -v T="$T" -v P="$RDMA_PORT" '
-    BEGIN { n = split("threads tcp rdma rdma-port", order, " ")
-            want["threads"] = T; want["tcp"] = "y"; want["rdma"] = "y"; want["rdma-port"] = P }
+       sec=="nfsd" && /^[[:space:]]*[A-Za-z][^=]*=/ {print "           " $0}' "$ORIG"
+  awk -v T="$T" -v P="$RDMA_PORT" -v V42="$need42" '
+    BEGIN { n = split("threads tcp rdma rdma-port" (V42 ? " vers4.2" : ""), order, " ")
+            want["threads"] = T; want["tcp"] = "y"; want["rdma"] = "y"; want["rdma-port"] = P; want["vers4.2"] = "y" }
     function key(line,  k) { k = line; sub(/=.*/, "", k); gsub(/[[:space:]]/, "", k); return k }
     function hdr(line,  s) { s = line; gsub(/[][[:space:]]/, "", s); return tolower(s) }
     NR == FNR { if ($0 ~ /^[[:space:]]*\[/) { sec = hdr($0); if (sec == "nfsd") has = 1; next }
@@ -289,33 +532,38 @@ if [[ -s $NFS_CONF ]]; then
                         if (sec == "nfsd") for (i = 1; i <= n; i++) if (!(order[i] in present)) print order[i] "=" want[order[i]]
                         next }
     sec == "nfsd" && /^[[:space:]]*[A-Za-z][^=]*=/ { k = key($0)
-                        if (k in want) { if (!(k in done)) print k "=" want[k]; done[k] = 1; next } }
+                        if (k in want && (k != "vers4.2" || V42)) { if (!(k in done)) print k "=" want[k]; done[k] = 1; next } }
     { print }
     END { if (!has) { print ""; print "[nfsd]"; for (i = 1; i <= n; i++) print order[i] "=" want[order[i]] } }
-  ' "$NFS_CONF" "$NFS_CONF" > "$DIR/nfs.conf.proposed"
-else
-  info "$NFS_CONF missing or empty; proposing a minimal one"
-  : > "$DIR/nfs.conf.orig"
-  printf '[nfsd]\nthreads=%s\ntcp=y\nrdma=y\nrdma-port=%s\n' "$T" "$RDMA_PORT" > "$DIR/nfs.conf.proposed"
+  ' "$ORIG" "$ORIG" > "$PROP"
+  # Drop-ins in nfs.conf.d are read after nfs.conf and override it.
+  for f in "$CFG.d"/*.conf; do
+    [[ -r $f ]] || continue
+    ov=$(awk '/^[[:space:]]*\[/{s=$0; gsub(/[][[:space:]]/,"",s); sec=tolower(s); next}
+              sec=="nfsd" && /^[[:space:]]*[A-Za-z][^=]*=/ { k=$0; sub(/=.*/,"",k); gsub(/[[:space:]]/,"",k)
+                if (k ~ /^(threads|tcp|rdma|rdma-port|vers4\.2)$/) printf "%s%s", (n++ ? ", " : ""), $0 }' "$f")
+    [[ -n $ov ]] && warn "$f overrides $CFG with [nfsd] $ov — make the same change there or remove those lines"
+  done
+  ok_parse=0
+  if have nfsconf && [[ $(nfsconf --file "$PROP" --get nfsd rdma 2>/dev/null) == y ]]; then ok_parse=1; fi
+  stage="cmp -s $CFG $ORIG && cp -a $CFG $CFG.pre-rdma && cp $PROP $CFG"
+  verify "nfsconf --dump shows threads=$T, rdma=y, rdma-port=$RDMA_PORT under [nfsd] (includes nfs.conf.d overrides)"
 fi
-if cmp -s "$DIR/nfs.conf.orig" "$DIR/nfs.conf.proposed"; then
-  pass "$NFS_CONF already has the planned [nfsd] settings"
+grep -qs '^[[:space:]]*RPCNFSDCOUNT' /etc/sysconfig/nfs && [[ $style == nfsconf ]] &&
+  warn "/etc/sysconfig/nfs sets $(grep -m1 '^[[:space:]]*RPCNFSDCOUNT' /etc/sysconfig/nfs); this nfs-utils reads $CFG — remove it so the two can't disagree"
+
+if cmp -s <(awk 1 "$ORIG") "$PROP"; then
+  pass "$CFG already has the planned settings"
 else
-  info "proposed change to $NFS_CONF:"
-  diff -u "$DIR/nfs.conf.orig" "$DIR/nfs.conf.proposed" | tail -n +3 | sed 's/^/           /'
-  if have nfsconf; then
-    if [[ $(nfsconf --file "$DIR/nfs.conf.proposed" --get nfsd rdma 2>/dev/null) == y ]]; then
-      pass "nfsconf parses the proposed file (nfsd rdma=y)"
-    else
-      warn "nfsconf could not confirm the proposed file; check it by eye"
-    fi
-  fi
-  live "Stage $NFS_CONF so the settings persist (read at the next nfs-server start; nothing changes now)
-    cmp -s $NFS_CONF $DIR/nfs.conf.orig && cp -a $NFS_CONF $NFS_CONF.pre-rdma && cp $DIR/nfs.conf.proposed $NFS_CONF"
+  info "proposed change to $CFG:"
+  diff -u "$ORIG" "$PROP" | tail -n +3 | sed 's/^/           /'
+  if ((ok_parse)); then pass "nfsconf parses the proposed file (nfsd rdma=y)"
+  elif [[ $style == nfsconf ]] && have nfsconf; then warn "nfsconf could not confirm the proposed file; check it by eye"; fi
+  live "Stage $CFG so the settings persist (read at the next nfs-server start; nothing changes now)
+    $stage"
 fi
 
-# nfsd thread pressure, same method as nfsd-starve.sh:
-# share of arrivals that did not wake an idle thread = (arrived - woken) / arrived
+# nfsd thread pressure: share of arrivals that did not wake an idle thread = (arrived - woken) / arrived
 if (( SAMPLE > 0 )) && [[ -r $NFSD_PROC/pool_stats ]]; then
   snap() {
     awk '/^#/ { for (i = 2; i <= NF; i++) c[$i] = i - 1; next }
@@ -328,7 +576,7 @@ if (( SAMPLE > 0 )) && [[ -r $NFSD_PROC/pool_stats ]]; then
   read -r a1 w1 < <(snap); sleep "$SAMPLE"; read -r a2 w2 < <(snap)
   da=$((a2 - a1)); dw=$((w2 - w1))
   if (( da > 0 )); then
-    pct=$(awk -v a="$da" -v w="$dw" 'BEGIN{printf "%.2f", 100 * (a - w) / a}')
+    pct=$(awk -v a="$da" -v w="$dw" 'BEGIN{p = 100 * (a - w) / a; printf "%.2f", p < 0 ? 0 : p}')
     msg="$(( da / SAMPLE )) arrivals/s; ${pct}% found no idle nfsd thread (${threads:-?} threads)"
     if awk -v p="$pct" 'BEGIN{exit !(p < 0.5)}'; then pass "$msg"
     else warn "$msg — under current load the server needs more threads"; fi
@@ -339,41 +587,37 @@ fi
 
 # ------------------------------------------------------------------ exports
 head1 "Exports"
-first_export=""
-if have exportfs; then
-  ex=$(exportfs -s 2>/dev/null)
-  if [[ -z $ex ]]; then
-    warn "no exports listed (not root, or nothing exported)"
-  else
-    noins=()
-    while read -r path specs; do
-      [[ -z $path ]] && continue
-      first_export=${first_export:-$path}
-      for s in $specs; do
-        opts=${s#*(}; opts=${opts%)}
-        [[ ,$opts, == *,insecure,* ]] || noins+=("$path ${s%%(*}")
-      done
-    done <<<"$ex"
-    info "$(wc -l <<<"$ex") export line(s)"
-    if ((${#noins[@]})); then
-      warn "${#noins[@]} export/client pair(s) lack 'insecure'; the kernel's NFS/RDMA docs require it because RDMA clients don't use a reserved port:"
-      printf '           %s\n' "${noins[@]}"
-      zcmds=""
-      if have zfs; then
-        while IFS=$'\t' read -r ds val; do
-          if [[ $val == on ]]; then zcmds+=$'\n'"    # $ds has sharenfs=on: set explicit options including insecure, e.g. zfs set sharenfs='rw,insecure,...' $ds"
-          elif [[ $val != *insecure* ]]; then zcmds+=$'\n'"    zfs set sharenfs='$val,insecure' $ds"; fi
-        done < <(zfs get -H -o name,value -s local sharenfs 2>/dev/null | awk -F'\t' '$2 != "off"')
-      fi
-      live "Add 'insecure' to the exports above (re-export only; brief and low impact, best done at a quiet moment)
-    /etc/exports entries: add insecure to the client options, then: exportfs -ra${zcmds}
-    exportfs -s | grep -v insecure     # expect no output"
-    else
-      pass "all exports allow unreserved ports (insecure)"
-    fi
-  fi
-else
+first_export=${EXPORT_PATHS[0]:-}
+if ! have exportfs; then
   warn "exportfs not found"
+elif [[ -z $EXPORTS ]]; then
+  warn "no exports listed (not root, or nothing exported)"
+else
+  noins=()
+  while read -r path specs; do
+    [[ -z $path ]] && continue
+    for s in $specs; do
+      opts=${s#*(}; opts=${opts%)}
+      [[ ,$opts, == *,insecure,* ]] || noins+=("$path ${s%%(*}")
+    done
+  done <<<"$EXPORTS"
+  info "$(wc -l <<<"$EXPORTS") export line(s)"
+  if ((${#noins[@]})); then
+    warn "${#noins[@]} export/client pair(s) lack 'insecure'; the kernel's NFS/RDMA docs require it because RDMA clients don't use a reserved port:"
+    printf '           %s\n' "${noins[@]}"
+    zcmds=""
+    if have zfs; then
+      while IFS=$'\t' read -r ds val; do
+        if [[ $val == on ]]; then zcmds+=$'\n'"    # $ds has sharenfs=on: set explicit options including insecure, e.g. zfs set sharenfs='rw,insecure,...' $ds"
+        elif [[ $val != *insecure* ]]; then zcmds+=$'\n'"    zfs set sharenfs='$val,insecure' $ds"; fi
+      done < <(zfs get -H -o name,value -s local sharenfs 2>/dev/null | awk -F'\t' '$2 != "off"')
+    fi
+    live "Add 'insecure' to the exports above (re-export only; brief and low impact, best done at a quiet moment)
+    /etc/exports (and /etc/exports.d/*.exports) entries: add insecure to the client options, then: exportfs -ra${zcmds}
+    exportfs -s | grep -v insecure     # expect no output"
+  else
+    pass "all exports allow unreserved ports (insecure)"
+  fi
 fi
 
 # ------------------------------------------------------------------ firewall
@@ -385,8 +629,15 @@ if systemctl is-active -q firewalld 2>/dev/null; then
     live "Open the NFS/RDMA port in firewalld (no impact)
     firewall-cmd --permanent --add-port={$RDMA_PORT/tcp,$RDMA_PORT/udp} && firewall-cmd --reload"
   fi
+elif have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
+  if ufw status 2>/dev/null | grep -Eq "^$RDMA_PORT(/tcp)?[[:space:]].*ALLOW"; then pass "ufw allows $RDMA_PORT/tcp"
+  else
+    info "ufw active, $RDMA_PORT not open (RDMA bypasses netfilter; opening it keeps the rules honest)"
+    live "Open the NFS/RDMA port in ufw (no impact)
+    ufw allow $RDMA_PORT/tcp"
+  fi
 else
-  info "firewalld not active"
+  info "no active firewalld or ufw"
 fi
 
 # ------------------------------------------------------------------ clients
@@ -407,7 +658,8 @@ fi
 ip_only=${addr%/*}
 live "Pilot ONE client over RDMA (only that node is affected; RDMA works at the current IB MTU)
     # on the client, with the same rsize/wsize it uses today:
-    dnf install -y rdma-core nfs-utils && modprobe xprtrdma
+    dnf install -y rdma-core nfs-utils      # Ubuntu: apt-get install -y rdma-core nfs-common; EL7: yum
+    modprobe xprtrdma
     mkdir -p /mnt/rdmatest
     mount -t nfs -o proto=rdma,port=$RDMA_PORT,vers=4.2,hard ${ip_only:-<NAS IPoIB address>}:${first_export:-<export>} /mnt/rdmatest
     grep -A4 ' /mnt/rdmatest ' /proc/self/mountstats | grep xprt    # expect: xprt: rdma
@@ -416,15 +668,24 @@ live "Pilot ONE client over RDMA (only that node is affected; RDMA works at the 
 window "Confirm the new MTU everywhere
     ibv_devinfo | grep active_mtu                       # this host: $TARGET_IB_MTU
     pdsh -a 'ibv_devinfo | grep active_mtu' | dshbak -c # every node"
+if ((need42)); then
+  window "Restart nfs-server to turn on NFSv4.2 and load the staged config (NFSv4 clients pause for the grace period)
+    systemctl restart nfs-server
+    cat $NFSD_PROC/versions $NFSD_PROC/portlist $NFSD_PROC/threads    # expect +4.2, rdma $RDMA_PORT, $T"
+fi
 window "Move clients to RDMA (update fstab/autofs per runbook step 6, then remount), in the order of nfs-clients.txt"
-window "Optional: prove the staged config survives a restart (NFSv4 clients pause for the grace period)
+if ((!need42)); then
+  window "Optional: prove the staged config survives a restart (NFSv4 clients pause for the grace period)
     systemctl restart nfs-server
     cat $NFSD_PROC/portlist $NFSD_PROC/threads"
+fi
 
 verify "Re-run this script: every [WARN] above should be gone and the IB MTU should read $TARGET_IB_MTU"
-verify "On a client: nfsstat -m shows proto=rdma; then capture the after-run with nfsbench.sh"
+verify "On a client: nfsstat -m shows proto=rdma,vers=4.2; then capture the after-run with nfsbench.sh"
 verify "dmesg -T | grep -iE 'rpcrdma|svcrdma' on the NAS and a client: no errors"
 
+printf '\n== Discovered ==\n'
+printf '  %s\n' "${PROFILE[@]}"
 printf '\n== Summary ==\n  %d OK, %d warnings, %d blockers\n' "$NPASS" "$NWARN" "$NFAIL"
 (( NFAIL )) && echo "  Resolve every [FAIL] before the window."
 

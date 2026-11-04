@@ -3,7 +3,10 @@
 # "after" run can be compared with nfs_report.py.
 #
 # Run it on an NFS CLIENT (compute node). With SERVER_SSH set it also captures
-# server-side config, CPU, nfsd thread pressure and zpool I/O over ssh.
+# server-side config, CPU, nfsd thread pressure and storage I/O over ssh
+# (zpool iostat on ZFS servers, iostat -x otherwise).
+#
+# Works on EL7-EL10 and Ubuntu 24.04/26.04, on clients and servers alike.
 #
 #   Subcommands
 #     run    <label> <mountpoint>   env snapshot (client+server) + fabric + fio suite
@@ -16,16 +19,17 @@
 #     RESULTS=./results     where results/<label>/... is written (use local disk)
 #     SERVER_SSH=           ssh target for the NFS server, e.g. root@nas01 (enables server capture)
 #     SERVER_IB_IP=         server IPoIB address (needed for fabric tests)
-#     IBDEV=mlx5_0          RDMA device on this host         SRV_IBDEV defaults to IBDEV
-#     IPOIB_IF=ib0          IPoIB interface on this host     SRV_IPOIB_IF defaults to IPOIB_IF
-#     ZPOOL=                pool name for zpool iostat (empty = all pools)
+#     IPOIB_IF=             IPoIB interface on this host (default: first one found)
+#     IBDEV=                RDMA device on this host (default: the one carrying IPOIB_IF)
+#     SRV_IPOIB_IF= SRV_IBDEV=   same for the server (default: detected on the server)
+#     ZPOOL=                ZFS servers: pool for zpool iostat (empty = all pools)
 #     SIZE=8G               file size per fio job
 #     RUNTIME=60 RAMP=10    seconds per fio test (measured) and warm-up (discarded)
 #     TESTS=all             comma list of test names to run (see TEST_DEFS below)
 #     SKIP_FABRIC=0         set 1 to skip fabric tests in "run"
 #
 # Example:
-#   SERVER_SSH=root@nas01 SERVER_IB_IP=10.10.0.1 ZPOOL=tank \
+#   SERVER_SSH=root@nas01 SERVER_IB_IP=10.10.0.1 \
 #     ./nfsbench.sh run baseline /mnt/scratch
 
 set -uo pipefail
@@ -33,10 +37,13 @@ set -uo pipefail
 RESULTS=${RESULTS:-./results}
 SERVER_SSH=${SERVER_SSH:-}
 SERVER_IB_IP=${SERVER_IB_IP:-}
-IBDEV=${IBDEV:-mlx5_0}
-IPOIB_IF=${IPOIB_IF:-ib0}
-SRV_IBDEV=${SRV_IBDEV:-$IBDEV}
-SRV_IPOIB_IF=${SRV_IPOIB_IF:-$IPOIB_IF}
+first_ipoib() { local n; for n in /sys/class/net/*; do [[ $(cat "$n/type" 2>/dev/null) == 32 ]] && { echo "${n##*/}"; return; }; done; }
+ipoib_ibdev() { ls "/sys/class/net/$1/device/infiniband" 2>/dev/null | head -1; }
+IPOIB_IF=${IPOIB_IF:-$(first_ipoib)}
+IBDEV=${IBDEV:-$(ipoib_ibdev "$IPOIB_IF")}
+IBDEV=${IBDEV:-$(ls /sys/class/infiniband 2>/dev/null | head -1)}
+SRV_IBDEV=${SRV_IBDEV:-}
+SRV_IPOIB_IF=${SRV_IPOIB_IF:-}
 ZPOOL=${ZPOOL:-}
 SIZE=${SIZE:-8G}
 RUNTIME=${RUNTIME:-60}
@@ -62,6 +69,10 @@ die()  { log "ERROR: $*"; exit 1; }
 kv()   { printf '%s=%s\n' "$1" "$2"; }
 sect() { printf '\n===== %s =====\n' "$1"; }
 srv()  { ssh "${SSH_OPTS[@]}" "$SERVER_SSH" "$@"; }
+srv_ibdev() {   # RDMA device on the server, detected once
+  [[ -n $SRV_IBDEV ]] && return
+  SRV_IBDEV=$(srv 'for n in /sys/class/net/*; do [ "$(cat $n/type 2>/dev/null)" = 32 ] && { ls $n/device/infiniband 2>/dev/null | head -1; exit; }; done; ls /sys/class/infiniband | head -1')
+}
 
 # ---------------------------------------------------------------- env snapshot
 envprint() {
@@ -72,6 +83,7 @@ envprint() {
   kv date "$(date -Is)"
   kv os "$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")"
   kv kernel "$(uname -r)"
+  kv platform "$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null) $(cat /sys/class/dmi/id/product_name 2>/dev/null)"
   kv cpu_model "$(LC_ALL=C lscpu | awk -F: '/^Model name/{sub(/^ +/,"",$2);print $2;exit}')"
   kv cpu_sockets "$(LC_ALL=C lscpu | awk -F: '/^Socket\(s\)/{gsub(/ /,"",$2);print $2;exit}')"
   kv cpu_logical "$(nproc --all)"
@@ -80,6 +92,11 @@ envprint() {
   kv ib_link_layer "$(ibv_devinfo -d "$IBDEV" 2>/dev/null | awk '/link_layer/{print $2;exit}')"
   kv ib_active_mtu "$(ibv_devinfo -d "$IBDEV" 2>/dev/null | awk '/active_mtu/{print $2;exit}')"
   kv ib_rate "$(cat /sys/class/infiniband/"$IBDEV"/ports/1/rate 2>/dev/null)"
+  kv ib_device "$IBDEV"
+  kv ib_driver "$(basename "$(readlink /sys/class/infiniband/"$IBDEV"/device/driver 2>/dev/null)" 2>/dev/null)"
+  local ibs=/sys/class/infiniband/$IBDEV
+  kv hca "$([[ -n $IBDEV && -e $ibs ]] && echo "$(cat "$ibs/hca_type" 2>/dev/null) fw $(cat "$ibs/fw_ver" 2>/dev/null)")"
+  kv pcie_link "$([[ -n $IBDEV && -e $ibs/device/current_link_width ]] && echo "$(cat "$ibs/device/current_link_speed") x$(cat "$ibs/device/current_link_width")")"
   kv ipoib_mode "$(cat /sys/class/net/"$IPOIB_IF"/mode 2>/dev/null)"
   kv ipoib_mtu "$(cat /sys/class/net/"$IPOIB_IF"/mtu 2>/dev/null)"
   kv rpcrdma_loaded "$(lsmod | awk '$1=="rpcrdma"{f=1} END{print f?"yes":"no"}')"
@@ -88,6 +105,7 @@ envprint() {
     kv nfsd_listeners "$(paste -sd' ' /proc/fs/nfsd/portlist 2>/dev/null)"
     kv nfsd_versions "$(cat /proc/fs/nfsd/versions 2>/dev/null)"
     kv sunrpc_pool_mode "$(cat /sys/module/sunrpc/parameters/pool_mode 2>/dev/null)"
+    kv storage "$(exportfs -s 2>/dev/null | awk 'NF{print $1}' | sort -u | while read -r p; do findmnt -no FSTYPE -T "$p"; done | sort | uniq -c | awk '{printf "%s%s x%s", (NR>1?", ":""), $2, $1}')"
     kv zfs_version "$(cat /sys/module/zfs/version 2>/dev/null)"
     kv arc_max_gib "$(awk '$1=="c_max"{printf "%.1f",$3/1073741824}' /proc/spl/kstat/zfs/arcstats 2>/dev/null)"
   else
@@ -103,15 +121,26 @@ envprint() {
   sect "ipoib module";      grep -H . /sys/module/ib_ipoib/parameters/* 2>/dev/null
   sect "lscpu";             lscpu 2>&1
   if [[ $role == server ]]; then
-    sect "/etc/nfs.conf (active lines)"; grep -Ev '^\s*(#|$)' /etc/nfs.conf 2>&1
+    if command -v nfsconf >/dev/null; then
+      sect "nfsconf --dump (nfs.conf + nfs.conf.d)"; nfsconf --dump 2>&1
+    else
+      sect "/etc/sysconfig/nfs (active lines)"; grep -Ev '^\s*(#|$)' /etc/sysconfig/nfs 2>&1
+    fi
     sect "exportfs -v";     exportfs -v 2>&1
     sect "pool_stats";      cat /proc/fs/nfsd/pool_stats 2>&1
     sect "nfsstat -s";      nfsstat -s 2>&1
-    sect "zpool status";    zpool status 2>&1
-    sect "zpool list";      zpool list -v 2>&1
-    sect "zfs props";       zfs get -t filesystem -o name,property,value \
+    sect "exported filesystems"
+    exportfs -s 2>/dev/null | awk 'NF{print $1}' | sort -u | while read -r p; do
+      findmnt -no TARGET,FSTYPE,SOURCE,OPTIONS -T "$p"; done 2>&1
+    sect "lsblk";           lsblk -o NAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,MODEL 2>&1
+    [ -r /proc/mdstat ] && { sect "mdstat"; cat /proc/mdstat; }
+    if command -v zpool >/dev/null && [ -n "$(zpool list -H -o name 2>/dev/null)" ]; then
+      sect "zpool status";  zpool status 2>&1
+      sect "zpool list";    zpool list -v 2>&1
+      sect "zfs props";     zfs get -t filesystem -o name,property,value \
                               recordsize,compression,sync,atime,primarycache,logbias,xattr 2>&1
-    sect "arc_summary";     (arc_summary -s arc 2>/dev/null || arc_summary 2>&1) | head -60
+      sect "arc_summary";   (arc_summary -s arc 2>/dev/null || arc_summary 2>&1) | head -60
+    fi
   else
     sect "nfsstat -m";      nfsstat -m 2>&1
   fi
@@ -129,7 +158,7 @@ server_env() {
   [[ -n $SERVER_SSH ]] || { log "SERVER_SSH not set; skipping server snapshot"; return; }
   local d="$RESULTS/$label/env"; mkdir -p "$d"
   local shost; shost=$(srv hostname -s) || { log "cannot ssh to $SERVER_SSH"; return; }
-  srv "IBDEV=$SRV_IBDEV IPOIB_IF=$SRV_IPOIB_IF bash -s -- envprint server" < "$0" \
+  srv "IBDEV='$SRV_IBDEV' IPOIB_IF='$SRV_IPOIB_IF' bash -s -- envprint server" < "$0" \
     > "$d/server-$shost.txt"
   log "server env snapshot -> $d/server-$shost.txt"
 }
@@ -149,6 +178,8 @@ cmd_fabric() {
   local label=$1
   [[ -n $SERVER_SSH && -n $SERVER_IB_IP ]] || die "fabric needs SERVER_SSH and SERVER_IB_IP"
   local d="$RESULTS/$label/fabric"; mkdir -p "$d"
+  srv_ibdev
+  [[ -n $IBDEV && -n $SRV_IBDEV ]] || die "no RDMA device found (client: '$IBDEV', server: '$SRV_IBDEV'); set IBDEV/SRV_IBDEV"
   log "fabric: iperf3 over IPoIB (TCP) to $SERVER_IB_IP"
   srv "pkill -x iperf3; iperf3 -s -D -1" >/dev/null 2>&1
   sleep 1
@@ -192,7 +223,8 @@ cmd_fio() {
     if [[ -n $SERVER_SSH ]]; then
       srv cat /proc/fs/nfsd/pool_stats > "$sdir/$name.pool_stats.before" 2>&1
       srv "sleep $RAMP; LC_ALL=C mpstat 1 $RUNTIME" > "$sdir/$name.mpstat.txt" 2>&1 &
-      srv "sleep $RAMP; zpool iostat -y $ZPOOL 1 $RUNTIME" > "$sdir/$name.zpool_iostat.txt" 2>&1 &
+      srv "sleep $RAMP; if command -v zpool >/dev/null && [ -n \"\$(zpool list -H -o name 2>/dev/null)\" ]; then zpool iostat -y $ZPOOL 1 $RUNTIME; else LC_ALL=C iostat -dxmy 1 $RUNTIME; fi" \
+        > "$sdir/$name.storage_iostat.txt" 2>&1 &
     fi
 
     fio --name="$name" --directory="$wdir" --filename_format='nfsbench.$jobnum' \
@@ -215,7 +247,15 @@ cmd_check() {
     command -v "$t" >/dev/null || { echo "missing: $t"; missing=1; }
   done
   [[ $missing == 0 ]] && echo "all client-side tools present"
-  echo "packages: dnf install fio sysstat iperf3 perftest infiniband-diags libibverbs-utils nfs-utils"
+  [[ -n $IBDEV ]] && echo "RDMA device: $IBDEV, IPoIB: ${IPOIB_IF:-none}" || echo "missing: no RDMA device found"
+  local id="" like="" ver=""
+  [[ -r /etc/os-release ]] && { id=$(. /etc/os-release; echo "${ID:-}"); like=$(. /etc/os-release; echo "${ID_LIKE:-}"); ver=$(. /etc/os-release; echo "${VERSION_ID:-}"); }
+  case " $id $like " in
+    *" ubuntu "*|*" debian "*) echo "packages: apt-get install fio sysstat iperf3 perftest infiniband-diags ibverbs-utils nfs-common" ;;
+    *) local pm=dnf; [[ ${ver%%.*} == 7 ]] && pm=yum
+       echo "packages: $pm install fio sysstat iperf3 perftest infiniband-diags libibverbs-utils nfs-utils" ;;
+  esac
+  echo "the NFS server also needs sysstat (mpstat, iostat) for server-side capture"
 }
 
 cmd_run() {
@@ -240,5 +280,5 @@ case ${1:-} in
             cmd_env "$2" "$3" "${4:-}" ;;
   envprint) envprint "${2:-client}" "${3:-}" ;;
   check)    cmd_check ;;
-  *)        sed -n '2,32p' "$0"; exit 1 ;;
+  *)        sed -n '2,/^$/p' "$0"; exit 1 ;;
 esac
