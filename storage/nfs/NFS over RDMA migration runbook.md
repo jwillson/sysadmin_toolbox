@@ -10,7 +10,7 @@ This runbook moves an InfiniBand-attached NAS and its clients from NFS over TCP/
 | --- | --- | --- |
 | IB partition MTU (set by the subnet manager; IPoIB only) | 2048 | 4096 (optional) |
 | IPoIB mode / MTU | datagram / 2044 | datagram / 4092 (recommended), or connected / 65520 |
-| nfsd threads | 8 (distribution default) | max(64, logical CPUs rounded up to a multiple of 16), validated by measurement |
+| nfsd threads | 8 (distribution default) | max(64, logical CPUs rounded up to a multiple of 16), or 128 with 20+ clients; validated by measurement |
 | Server listeners | tcp 2049 | rdma 20049 + tcp 2049 (TCP kept as fallback) |
 | Client mounts | proto=tcp, vers=4.2 | proto=rdma,port=20049, vers=4.2 |
 
@@ -332,7 +332,7 @@ Use the same IPoIB MTU on every host in the IPoIB subnet (NAS, compute, login no
 
 nfsd threads mostly wait on storage and the network, so more threads than cores is normal; 8 is a small-server default. Start at **max(64, logical CPUs rounded up to a multiple of 16)**. For example, a host with 24 or 48 logical CPUs gets 64, and one with 88 gets 96. The preflight never proposes fewer threads than the host already runs.
 
-On a shared HPC cluster, start higher. Slurm jobs that span many nodes read inputs and write checkpoints from all of them at once, so burst concurrency is far above the average. With 20 or more clients, 128 is a reasonable start; `THREADS=128` makes the preflight plan it.
+On a shared HPC cluster, start higher. Slurm jobs that span many nodes read inputs and write checkpoints from all of them at once, so burst concurrency is far above the average. With 20 or more clients, 128 is a reasonable start; the preflight counts the connected clients and plans 128 when it sees 20 or more (`THREADS=` overrides it).
 
 ```bash
 lscpu | grep -E '^(CPU\(s\)|Socket|Core|Thread|NUMA node\(s\))'

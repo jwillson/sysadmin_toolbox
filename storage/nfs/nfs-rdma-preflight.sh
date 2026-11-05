@@ -496,15 +496,24 @@ else
   fail "this kernel's nfsd has no NFSv4.2; clients mount vers=4.2 — update the kernel first"
 fi
 
+# Thread count: max(64, logical CPUs rounded up to 16); 128 or more once 20+ clients are
+# connected, because jobs spanning many nodes send bursts far above the average load.
 ceil16=$(( (logical + 15) / 16 * 16 ))
 T=$(( ceil16 > 64 ? ceil16 : 64 ))
+rule="max(64, $logical logical CPUs rounded up to 16)"
+nconn=0
+have ss && nconn=$(ss -Htn state established '( sport = :2049 )' 2>/dev/null \
+  | awk '{p = $4; sub(/:[0-9]+$/, "", p); print p}' | sort -u | wc -l)
+if (( nconn >= 20 && T < 128 )); then
+  T=128; rule="$nconn NFS clients connected (20 or more: start at 128)"
+fi
 if [[ -n ${THREADS:-} ]]; then
   T=$THREADS; info "planned nfsd threads: $T (THREADS= override)"
 elif [[ ${threads:-0} -gt $T ]]; then
-  info "planned nfsd threads: keep $threads (already above max(64, $logical logical CPUs rounded up to 16) = $T)"
+  info "planned nfsd threads: keep $threads (already above $rule = $T)"
   T=$threads
 else
-  info "planned nfsd threads: $T (max(64, $logical logical CPUs rounded up to 16); override with THREADS=)"
+  info "planned nfsd threads: $T ($rule; override with THREADS=)"
 fi
 
 if [[ " ${portlist//,/ } " == *"rdma $RDMA_PORT"* ]]; then
