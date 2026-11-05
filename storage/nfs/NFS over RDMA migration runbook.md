@@ -8,7 +8,7 @@ This runbook moves an InfiniBand-attached NAS and its clients from NFS over TCP/
 
 | Item | Typical now | Target |
 | --- | --- | --- |
-| IB partition MTU (set by the subnet manager) | 2048 | 4096 |
+| IB partition MTU (set by the subnet manager; IPoIB only) | 2048 | 4096 (optional) |
 | IPoIB mode / MTU | datagram / 2044 | datagram / 4092 (recommended), or connected / 65520 |
 | nfsd threads | 8 (distribution default) | max(64, logical CPUs rounded up to a multiple of 16), validated by measurement |
 | Server listeners | tcp 2049 | rdma 20049 + tcp 2049 (TCP kept as fallback) |
@@ -19,10 +19,12 @@ Each NAS is different, so start every host with the preflight (Phase 3, step 0).
 Three points shape the plan:
 
 - **The ports are usually already in InfiniBand mode.** IPoIB only runs on the IB link layer, so if IPoIB works, RDMA is available; NFS just isn't using it. The real change is the NFS transport.
-- **There are two MTUs.** The IB MTU that matters here comes from the subnet manager's partition (4096 max on FDR and EDR). Each port also reports its own `active_mtu`, which can already read 4096 while the partition is still 2048. The IPoIB MTU is the IP-layer value: IB MTU − 4 in datagram mode (2044 at 2048, 4092 at 4096), up to 65520 in connected mode. So IPoIB at 2044 in datagram mode means the partition is 2048, whatever `active_mtu` says.
-- **With proto=rdma, NFS data does not cross IPoIB.** IPoIB is used only to resolve the server's address; reads and writes move over RDMA connections. IPoIB MTU and mode therefore matter for the TCP baseline, fallback and other IP traffic, while the IB MTU matters for RDMA.
+- **There are two IB MTUs.** Each port's `active_mtu` (4096 max on FDR and EDR) sets the path MTU that RDMA connections, and so NFS over RDMA, use. The subnet manager's partition MTU sets the IPoIB broadcast group, and IPoIB can't exceed it: IB MTU − 4 in datagram mode (2044 at 2048, 4092 at 4096), up to 65520 in connected mode. The two often differ. Ports commonly read 4096 while the partition is still 2048, so IPoIB at 2044 doesn't mean RDMA runs at 2048.
+- **With proto=rdma, NFS data does not cross IPoIB.** IPoIB is used only to resolve the server's address; reads and writes move over RDMA connections. IPoIB MTU, mode and the partition MTU therefore matter for the TCP baseline, fallback and other IP traffic, while the port MTU matters for RDMA.
 
-Only the IB MTU change, and the IPoIB MTU that follows it, needs a cluster-wide maintenance window. More nfsd threads, the RDMA listener, the `insecure` export option and a pilot client can all be done live beforehand. Turning on NFSv4.2 on a server that has it disabled needs an nfsd restart, so it also goes in the window.
+NFS over RDMA itself may need no cluster-wide window. More nfsd threads, the RDMA listener, the `insecure` export option and a pilot client can all be done live. On Slurm, the remaining clients can be moved by draining them a group at a time. Three things do need a window: turning on NFSv4.2 where it is disabled (an nfsd restart), moving all clients at once if you prefer that, and raising the partition and IPoIB MTU. The MTU change only helps IPoIB/TCP traffic, so it's optional.
+
+Tested so far: syntax checks and stub configurations for all three scripts, and one real preflight run on EL8.6 with a ConnectX-4 EDR HCA and ZFS. The other distributions, ConnectX-3, netplan, and non-ZFS storage paths follow the vendor documentation but haven't run on hardware yet.
 
 ## Platform differences
 
@@ -34,7 +36,7 @@ The commands below show the EL8/EL9 form first. This table lists what differs el
 | NFS server package | nfs-utils | nfs-utils | nfs-utils | nfs-utils | nfs-kernel-server |
 | ibverbs tools package | libibverbs-utils | libibverbs-utils | libibverbs-utils | libibverbs-utils | ibverbs-utils |
 | nfsd settings | `/etc/sysconfig/nfs`: `RPCNFSDCOUNT=`, `RPCNFSDARGS="--rdma=20049"` | `/etc/nfs.conf` `[nfsd]` | `/etc/nfs.conf`; `/etc/nfs.conf.d/*.conf` overrides it | as EL9 | as EL9 (upgrades from 20.04 may have `nfs.conf.d/local.conf`) |
-| Load svcrdma at boot | `SVCRDMA_LOAD=yes` in `/etc/rdma/rdma.conf` | `/etc/modules-load.d/nfs-rdma.conf` | same | same | same |
+| Load svcrdma at boot | `SVCRDMA_LOAD=yes` in `/etc/rdma/rdma.conf` | `/etc/modules-load.d/nfs-rdma-server.conf` | same | same | same |
 | NFS/RDMA kernel module | in the kernel | in the kernel | in the kernel | in the kernel | may need `linux-modules-extra-$(uname -r)` |
 | IPoIB configured by | NetworkManager or ifcfg | NetworkManager or ifcfg | NetworkManager | NetworkManager (ifcfg removed) | netplan |
 | Firewall | firewalld | firewalld | firewalld | firewalld | ufw, often inactive |
@@ -76,7 +78,7 @@ apt-get install -y fio sysstat iperf3 perftest infiniband-diags ibverbs-utils rd
 The scripts:
 
 - **`nfs-rdma-preflight.sh`** runs on the NAS and changes nothing. It discovers the host, checks every precondition, works out that host's values (thread count, IPoIB MTU, the exact NFS config edit) and prints the commands, split into what can be done live and what needs the window.
-- **`nfsbench.sh`** runs on a client. `run <label> <mount>` snapshots client and server config, runs the fabric tests, then a 7-test fio suite while sampling server and client CPU, nfsd thread pressure, storage I/O and RPC times. Results land in `results/<label>/`. `./nfsbench.sh check` lists missing tools and the install command for that host.
+- **`nfsbench.sh`** runs on a client. `run <label> <mount>` snapshots client and server config, runs the fabric tests, then a fio suite while sampling server and client CPU, nfsd thread pressure, storage I/O and RPC times. The suite has 7 data tests and 3 metadata tests: creating, statting and deleting empty files, each timed per operation. Results land in `results/<label>/`. `local <label> <dir>` runs the same suite on the NAS against the dataset, without NFS, to measure the storage maximum. `./nfsbench.sh check` lists missing tools and the install command for that host.
 - **`nfs_report.py`** reads one or more result directories and writes a self-contained HTML report plus a Markdown copy, with a % change column against the first run. It needs only Python 3.6+, which every supported release has.
 
 Server-side capture uses passwordless root ssh from the test client to the NAS (`SERVER_SSH`). Without it the fio numbers are still captured, but the server CPU, nfsd and storage columns stay empty. The scripts find the RDMA device and IPoIB interface on each host themselves; set `IBDEV`/`IPOIB_IF` (and `SRV_IBDEV`/`SRV_IPOIB_IF` for the server) only to pick a different one. iperf3 before 3.16 is single-threaded, so its 8 streams share one core; treat that number as a lower bound.
@@ -147,6 +149,28 @@ for n in node0{2..8}; do rsync -a $n:/root/nfsbench/results/baseline-8n/ results
 
 Per test, `results/<label>/` holds the fio JSON, client and server `mpstat`, `pool_stats` and `mountstats` snapshots taken before and after, and the server's `storage_iostat` output. The fio test files stay in `<mount>/nfsbench.<host>/` so the after-run reuses the same layout; delete them when you're done.
 
+### Storage maximum on the NAS
+
+To see what the storage delivers without NFS, run the same suite on the NAS against the exported dataset. Use more data than RAM, so reads come from disk rather than cache; before ZFS 2.3, O_DIRECT doesn't bypass the ARC. The script warns if `SIZE` is too small. It needs the same quiet period as the client captures.
+
+```bash
+# on the NAS, in the quiet period
+SIZE=128G RESULTS=/root/nfsbench/results ./nfsbench.sh local baseline-local /tank/scratch
+python3 nfs_report.py results/baseline results/baseline-local -o storage-vs-nfs.html
+```
+
+Replace `/tank/scratch` with a directory on the dataset you export, and set `SIZE` to about half the RAM in GiB, so 4 jobs write 2× RAM. One capture is enough; the storage doesn't change with the migration.
+
+### Metadata at scale (optional)
+
+The built-in metadata tests run from one client, or from each client in an aggregate run. For the load a many-node Slurm job generates, mdtest (part of [IOR](https://ior.readthedocs.io/)) runs the same create, stat and delete pattern under MPI. Where the cluster's MPI stack provides it:
+
+```bash
+srun --reservation=nfs-bench -N 8 --ntasks-per-node=8 mdtest -n 1000 -i 2 -u -d /mnt/scratch/mdtest.baseline
+```
+
+Its summary prints operations per second for file creation, stat and removal. `nfs_report.py` doesn't parse it, so record the numbers alongside the report and rerun the identical command after the migration.
+
 ## Phase 2 — Build the report
 
 One command turns result directories into `nfs-report.html` (self-contained, opens in any browser, safe to email) and `nfs-report.md`:
@@ -162,11 +186,13 @@ How to read the baseline before changing anything:
 - **nfsd arrivals that found no idle thread** above \~1–2% under load means the server is thread-starved. Expect this at 8 threads. (The `sockets-enqueued` column is not used: since EL8 it counts every enqueue, not only those that waited.)
 - **Server CPU in kernel** high during TCP tests is network-stack and copy overhead, which RDMA removes.
 - **fio latency far above the NFS RPC round-trip** means time is lost queuing on the client, not on the server or wire.
+- **Metadata tests** time each create, stat or delete. "RPCs per file" below 1 means the client answered from its attribute cache, so that test partly measures the client, not the server. Compare runs with each other, not with local disk.
+- **A `local` run next to an NFS run** shows the storage maximum: the gap between the two is NFS and the transport, and what's left is the disks.
 - **Sequential read near the iperf3 figure** means IPoIB TCP is the ceiling; near the RDMA figure means the transport isn't the limit. An RDMA figure well below the link rate points at the PCIe slot (check the configuration table).
 
 ## Phase 3 — Migrate
 
-Steps 1 and 4–5, plus a pilot of step 6 on one node, can be done live; TCP clients keep working. Steps 2–3, enabling NFSv4.2 where it is off, and moving the clients in step 6 interrupt service and belong in the window. On Slurm, groups of nodes can also be drained and moved beforehand (step 6).
+Steps 1 and 4–5, plus a pilot of step 6 on one node, can be done live; TCP clients keep working. Enabling NFSv4.2 where it is off, and moving the clients in step 6 all at once, interrupt service and belong in the window. On Slurm, groups of nodes can instead be drained and moved beforehand (step 6). Steps 2–3 are optional: they raise the IPoIB MTU, which NFS over RDMA doesn't use, and need their own cluster-wide window.
 
 On a Slurm cluster, before the window:
 
@@ -237,7 +263,9 @@ mstconfig -d 0000:3b:00.0 set LINK_TYPE_P1=1               # 1 = IB, 2 = ETH; th
 
 If MLNX\_OFED or DOCA-OFED is installed instead of the inbox stack (`ofed_info -s` prints a version), confirm `modinfo rpcrdma` resolves. Older MLNX\_OFED releases only included NFS over RDMA when installed with `--with-nfsrdma`.
 
-### 2. Raise the IB MTU to 4096 at the subnet manager
+### 2. Optional: raise the partition MTU to 4096 at the subnet manager
+
+First confirm what RDMA already uses. As root on a client, `saquery -p --src-to-dst <client LID>:<NAS LID>` (LIDs from `ibstat`) prints the path record; an `Mtu` ending in 5 means 4096. The baseline's `fabric/ib_write_bw.txt` also shows `Mtu : 4096[B]`. If both read 4096, NFS over RDMA already runs at 4096. Steps 2–3 then only speed up IPoIB/TCP traffic (fallback mounts, other IP services), and you can skip them or schedule them separately.
 
 The MTU that caps IPoIB is set by the subnet manager's partition, not on the hosts. Check it from any node as root; the IPoIB broadcast group's `Mtu` field ends in 4 for 2048 and 5 for 4096 (e.g. `0x84`, `0x85`):
 
@@ -261,7 +289,7 @@ The IPoIB broadcast group is re-created at the new MTU, so bounce IPoIB on every
 pdsh -a 'cat /sys/class/net/ib0/mtu' | dshbak -c           # every node: 4092; 2044 means the partition is still 2048
 ```
 
-### 3. Set IPoIB mode and MTU (server and every client)
+### 3. Optional: set IPoIB mode and MTU (server and every client)
 
 Check what the driver allows first:
 
@@ -322,7 +350,7 @@ Load the transport now and at boot:
 
 ```bash
 modprobe svcrdma                                            # alias for rpcrdma on current kernels
-echo svcrdma > /etc/modules-load.d/nfs-rdma.conf            # EL8+ and Ubuntu
+echo svcrdma > /etc/modules-load.d/nfs-rdma-server.conf     # EL8+ and Ubuntu
 # EL7: set SVCRDMA_LOAD=yes in /etc/rdma/rdma.conf instead
 ```
 
@@ -377,7 +405,7 @@ After the pilot, you can move further nodes the same way, a group at a time (`no
 
 ```bash
 dnf install -y rdma-core nfs-utils                          # EL7: yum; Ubuntu: apt-get install -y rdma-core nfs-common
-echo xprtrdma > /etc/modules-load.d/nfs-rdma.conf && modprobe xprtrdma
+echo xprtrdma > /etc/modules-load.d/nfs-rdma-client.conf && modprobe xprtrdma
 umount /mnt/scratch
 mount -t nfs -o proto=rdma,port=20049,vers=4.2,rsize=1048576,wsize=1048576,hard nas01-ib:/tank/scratch /mnt/scratch
 nfsstat -m | grep -A1 /mnt/scratch                          # proto=rdma
@@ -427,9 +455,10 @@ python3 nfs_report.py results/baseline results/tuned-tcp results/rdma -o nfs-rep
 
 What to expect, and what it means if you don't see it:
 
-- **Fabric:** RDMA bandwidth should sit near line rate (roughly 95+ Gb/s on EDR, 50+ on FDR) in both runs; it doesn't depend on NFS. If it is far lower, check the PCIe link in the configuration table. iperf3 should rise with the larger IPoIB MTU.
+- **Fabric:** RDMA bandwidth should sit near line rate (roughly 95+ Gb/s on EDR, 50+ on FDR) in both runs; it doesn't depend on NFS. If it is far lower, check the PCIe link in the configuration table. iperf3 rises only if you did steps 2–3.
 - **Small I/O and QD1 latency:** the largest relative gains, with lower server kernel CPU. If they don't move, check the configuration table says `rdma` for the transport.
 - **Large sequential reads (warm):** should approach the RDMA ceiling until a client's CPU or the server's memory bandwidth becomes the limit; the multi-client run shows the server's limit.
+- **Metadata (create, stat, delete):** each operation is a small round trip, so RDMA should cut time per operation. Stat often moves least, because the client answers many stats from its attribute cache; the "RPCs per file" row shows how many reached the server.
 - **Writes:** if sync-heavy, often bound by the storage rather than the transport (on ZFS, the intent log and SLOG), so gains may be modest. Check the `storage_iostat` output.
 - **nfsd arrivals that found no idle thread** should be near zero with the new thread count; if not, raise threads and re-run.
 
@@ -448,6 +477,7 @@ What to expect, and what it means if you don't see it:
 | Mode stays `datagram` after option B | Enhanced IPoIB still active (mlx5) | Use option A, or set `ipoib_enhanced=0` on the module that offers it and rebuild initramfs |
 | Large IP packets dropped, small ones fine | IPoIB MTU differs between hosts | Same MTU on every host in the subnet |
 | High *nfsd arrivals that found no idle thread* | Too few threads for the load | Raise threads by half; re-run the multi-client capture |
+| `fio: skipping meta_…` in the nfsbench log | This fio lacks the filecreate/filestat/filedelete engines | `fio --enghelp`; install a newer fio, or use mdtest |
 | `rpcrdma` errors or reconnects in `dmesg` | Fabric errors on a port or cable | `ibqueryerrors`; `perfquery -x` on the affected ports |
 
 ## Sources

@@ -45,7 +45,7 @@ mkdir -p "$DIR" || { echo "cannot create $DIR" >&2; exit 1; }
 exec > >(tee "$DIR/report.txt") 2>&1
 
 NPASS=0 NWARN=0 NFAIL=0
-LIVE=() WINDOW=() VERIFY=() PROFILE=()
+LIVE=() WINDOW=() OPTIONAL=() VERIFY=() PROFILE=()
 pass()    { printf '  [ OK ] %s\n' "$*"; NPASS=$((NPASS + 1)); }
 warn()    { printf '  [WARN] %s\n' "$*"; NWARN=$((NWARN + 1)); }
 fail()    { printf '  [FAIL] %s\n' "$*"; NFAIL=$((NFAIL + 1)); }
@@ -54,6 +54,7 @@ head1()   { printf '\n== %s ==\n' "$*"; }
 have()    { command -v "$1" >/dev/null 2>&1; }
 live()    { LIVE+=("$1"); }
 window()  { WINDOW+=("$1"); }
+optional() { OPTIONAL+=("$1"); }
 verify()  { VERIFY+=("$1"); }
 profile() { PROFILE+=("$(printf '%-9s %s' "$1:" "$2")"); }
 mtu_code() { case $1 in 256) echo 1;; 512) echo 2;; 1024) echo 3;; 2048) echo 4;; 4096) echo 5;; *) echo "";; esac; }
@@ -220,7 +221,7 @@ for d in /sys/bus/pci/devices/*; do
     gbps=$(awk -v s="${cs%% *}" -v w="$cw" 'BEGIN { printf "%.0f", s * w * (s >= 8 ? 128 / 130 : 0.8) }')
     [[ -n $ibd ]] && PCIE_GBPS[$ibd]=$gbps
     if [[ ${cw:-0} -lt ${mw:-0} || ${cs%% *} != "${ms%% *}" ]]; then
-      warn "$pci runs at PCIe ${cs%% *} GT/s x$cw (about $gbps Gb/s); the card supports ${ms%% *} GT/s x$mw — reseat it or move it to a full-width slot"
+      info "$pci runs at PCIe ${cs%% *} GT/s x$cw (about $gbps Gb/s); the card supports ${ms%% *} GT/s x$mw (fine if that still exceeds the IB link rate; checked below)"
     else
       info "$pci PCIe ${cs%% *} GT/s x$cw, about $gbps Gb/s usable"
     fi
@@ -235,9 +236,16 @@ ipoib=()
 for n in /sys/class/net/*; do [[ $(rd "$n/type") == 32 ]] && ipoib+=("${n##*/}"); done
 IF=${IPOIB_IF:-${ipoib[0]:-}}
 ((${#ipoib[@]} > 1)) && [[ -z ${IPOIB_IF:-} ]] && info "IPoIB interfaces: ${ipoib[*]}; using $IF (set IPOIB_IF= to choose)"
-ibdev=""
-[[ -n $IF ]] && ibdev=$(ls "/sys/class/net/$IF/device/infiniband" 2>/dev/null | head -1)
-cur_mtu="" ib_rate=""
+ibdev="" ipport=""
+if [[ -n $IF ]]; then
+  ibdev=$(ls "/sys/class/net/$IF/device/infiniband" 2>/dev/null | head -1)
+  # IPoIB sets dev_port (dev_id on older kernels) to the HCA port number minus 1
+  n=$(rd "/sys/class/net/$IF/dev_port"); n=${n:-0}
+  di=$(rd "/sys/class/net/$IF/dev_id")
+  [[ $n == 0 && $di =~ ^0x[0-9a-fA-F]+$ ]] && n=$((di))
+  ipport=$((n + 1))
+fi
+cur_mtu="" ib_rate="" srv_lid=""
 ndev=0
 for d in /sys/class/infiniband/*; do
   [[ -e $d ]] || continue
@@ -248,9 +256,11 @@ for d in /sys/class/infiniband/*; do
     ll=$(rd "$p/link_layer"); state=$(rd "$p/state"); rate=$(rd "$p/rate")
     dvi=$(ibv_devinfo -d "$dev" -i "$port" 2>/dev/null)
     amtu=$(awk '/active_mtu/{print $2;exit}' <<<"$dvi"); mmtu=$(awk '/max_mtu/{print $2;exit}' <<<"$dvi")
-    tag=""; [[ $dev == "$ibdev" ]] && tag=" (carries $IF)"
+    tag=""; [[ $dev == "$ibdev" && $port == "$ipport" ]] && tag=" (carries $IF)"
     info "$dev port $port$tag: $ll, $state, $rate, MTU active ${amtu:-?} / max ${mmtu:-?}"
     [[ $dev == "$ibdev" || -z $ibdev ]] || continue
+    if [[ -n $ibdev && $port != "$ipport" ]]; then info "$dev port $port does not carry $IF; not checked"; continue; fi
+    [[ -n $ibdev ]] && srv_lid=$(rd "$p/lid")
     if [[ $ll == InfiniBand ]]; then pass "$dev port $port is in InfiniBand mode (RDMA available)"
     else fail "$dev port $port link layer is $ll; set LINK_TYPE_P$port=1 with mstconfig and reboot"; fi
     [[ $state == *ACTIVE* ]] && pass "$dev port $port is ACTIVE" || fail "$dev port $port is not ACTIVE ($state)"
@@ -285,16 +295,18 @@ if [[ -n $IF ]]; then
     fi
   fi
 fi
+# NFS over RDMA uses the path MTU between the two ports (set by the ports' MTU), not the partition MTU.
 if [[ -n $port_mtu ]]; then
-  if ((port_mtu >= TARGET_IB_MTU)); then pass "IB port MTU already $port_mtu"
-  else warn "IB port MTU is $port_mtu; target $TARGET_IB_MTU is set at the subnet manager (see below)"; fi
+  if ((port_mtu >= TARGET_IB_MTU)); then pass "IB port MTU $port_mtu: NFS over RDMA can use it, whatever the partition MTU"
+  else warn "IB port MTU is $port_mtu, so RDMA connections run at $port_mtu; check that the HCA (max_mtu) and switch ports support $TARGET_IB_MTU"; fi
 fi
+sm_needed=0
 if [[ -n $part_mtu ]]; then
   if ((part_mtu >= TARGET_IB_MTU)); then pass "partition MTU $part_mtu ($part_src)"
-  else warn "partition MTU is $part_mtu ($part_src): IPoIB stays at $((part_mtu - 4)) or below until the subnet manager raises it to $TARGET_IB_MTU"; fi
-  ((part_mtu < ${cur_mtu:-99999})) && cur_mtu=$part_mtu
+  else warn "partition MTU is $part_mtu ($part_src): IPoIB stays at $((part_mtu - 4)) until the subnet manager raises it; this affects IPoIB/TCP traffic only, not NFS over RDMA (optional Plan C)"; sm_needed=1; fi
 elif [[ -n $IF ]]; then
   info "could not read the partition MTU (needs saquery from infiniband-diags, as root)"
+  [[ -n $port_mtu ]] && ((port_mtu < TARGET_IB_MTU)) && sm_needed=1
 fi
 hdev=${ibdev:-$(ls /sys/class/infiniband 2>/dev/null | head -1)}; hdev=${hdev:-none}
 profile HCA "${IBDEV_HCA[$hdev]:-?} ($hdev, ${IBDEV_DRV[$hdev]:-?}), ${ib_rate:-link down}, IB MTU port ${port_mtu:-?} / partition ${part_mtu:-?}"
@@ -338,14 +350,14 @@ if systemctl is-active -q opensm 2>/dev/null; then
     info "no partition file yet (opensm defaults to a 2048 MTU)"
     sedcmd="echo 'Default=0x7fff, ipoib, mtu=$code : ALL=full;' > $pf"
   fi
-  [[ ${cur_mtu:-0} -lt $TARGET_IB_MTU ]] && window "Raise the IB MTU at the subnet manager (cluster-wide IPoIB rejoin; do the same on any standby SM)
+  ((sm_needed)) && optional "Raise the partition MTU at the subnet manager (cluster-wide IPoIB rejoin; do the same on any standby SM)
     cp -a $pf $pf.pre-rdma 2>/dev/null
     $sedcmd
     grep -E '^[[:space:]]*Default' $pf      # expect mtu=$code ($TARGET_IB_MTU)
     systemctl restart opensm"
 else
   info "opensm is not running on this host"
-  [[ ${cur_mtu:-0} -lt $TARGET_IB_MTU ]] && window "Raise the IB MTU at the subnet manager on \"${smdesc:-the SM node}\" (cluster-wide IPoIB rejoin)
+  ((sm_needed)) && optional "Raise the partition MTU at the subnet manager on \"${smdesc:-the SM node}\" (cluster-wide IPoIB rejoin)
     OpenSM host: set mtu=$code on the Default line of its partitions file, then systemctl restart opensm
     Managed switch / UFM: set the Default partition MTU to 4K per the vendor's procedure
     Apply the same change on every standby SM"
@@ -405,7 +417,7 @@ else
       networkd) cmd="set MTUBytes=$tgt under [Link] in $nd_file, then: networkctl reload; networkctl reconfigure $IF" ;;
       *)        cmd="ip link set $IF mtu $tgt    # and persist it in whatever configures $IF" ;;
     esac
-    window "After the SM change: IPoIB MTU $tgt on this host (brief IPoIB drop), and the same on EVERY host in the IPoIB subnet
+    optional "After the SM change: IPoIB MTU $tgt on this host (brief IPoIB drop), and the same on EVERY host in the IPoIB subnet
     $cmd
     cat /sys/class/net/$IF/mtu      # expect $tgt"
   fi
@@ -459,7 +471,7 @@ elif grep -Eqs '^[[:space:]]*svcrdma' /etc/rdma/modules/*.conf /etc/modules-load
 else
   warn "svcrdma is not loaded at boot"
   live "Load svcrdma at boot (no impact)
-    echo svcrdma > /etc/modules-load.d/nfs-rdma.conf"
+    echo svcrdma > /etc/modules-load.d/nfs-rdma-server.conf"
 fi
 
 # ------------------------------------------------------------------ nfs server
@@ -690,7 +702,7 @@ live "Pilot ONE client over RDMA (only that node is affected; RDMA works at the 
     grep -A4 ' /mnt/rdmatest ' /proc/self/mountstats | grep xprt    # expect: xprt: rdma
     # optional: ./nfsbench.sh fio pilot /mnt/rdmatest ; then umount /mnt/rdmatest"
 
-window "Confirm the new MTU everywhere (IPoIB only reaches $((TARGET_IB_MTU - 4)) once the partition is $TARGET_IB_MTU)
+((${#OPTIONAL[@]})) && optional "Confirm the new MTU everywhere (IPoIB only reaches $((TARGET_IB_MTU - 4)) once the partition is $TARGET_IB_MTU)
     cat /sys/class/net/${IF:-ib0}/mtu                          # this host: $((TARGET_IB_MTU - 4))
     pdsh -a 'cat /sys/class/net/ib0/mtu' | dshbak -c   # every node: $((TARGET_IB_MTU - 4)); $((TARGET_IB_MTU / 2 - 4)) means the partition is still $((TARGET_IB_MTU / 2))"
 if ((need42)); then
@@ -698,14 +710,17 @@ if ((need42)); then
     systemctl restart nfs-server
     cat $NFSD_PROC/versions $NFSD_PROC/portlist $NFSD_PROC/threads    # expect +4.2, rdma $RDMA_PORT, $T"
 fi
-window "Move clients to RDMA (update fstab/autofs per runbook step 6, then remount), in the order of nfs-clients.txt"
+window "Move the remaining clients to RDMA (update fstab/autofs per runbook step 6, then remount), in the order of nfs-clients.txt.
+    On Slurm, clients can instead be moved before the window a group at a time by draining them (runbook step 6)"
 if ((!need42)); then
   window "Optional: prove the staged config survives a restart (NFSv4 clients pause for the grace period)
     systemctl restart nfs-server
     cat $NFSD_PROC/portlist $NFSD_PROC/threads"
 fi
 
-verify "Re-run this script: every [WARN] above should be gone, and the port and partition MTU should both read $TARGET_IB_MTU"
+verify "Re-run this script: every [WARN] above should be gone (the partition MTU warning stays if you skip Plan C)"
+[[ -n $srv_lid ]] && verify "From a client, as root, confirm the path MTU the RDMA connections use (Mtu ending in 5 = 4096, 4 = 2048):
+    saquery -p --src-to-dst <client LID from ibstat>:$((srv_lid)) | grep -i mtu"
 verify "On a client: nfsstat -m shows proto=rdma,vers=4.2; then capture the after-run with nfsbench.sh"
 verify "dmesg -T | grep -iE 'rpcrdma|svcrdma' on the NAS and a client: no errors"
 
@@ -722,5 +737,6 @@ printplan() {
 }
 printplan "Plan A: before the window (live; TCP clients keep working)" "${LIVE[@]}"
 printplan "Plan B: in the window (cluster-wide interruption), in this order" "${WINDOW[@]}"
+((${#OPTIONAL[@]})) && printplan "Plan C: optional, its own cluster-wide window: raise the IPoIB MTU (IPoIB/TCP traffic only; NFS over RDMA does not need it)" "${OPTIONAL[@]}"
 printplan "Verify" "${VERIFY[@]}"
 printf '\nNothing was changed on this host. Report: %s/report.txt\n' "$DIR"

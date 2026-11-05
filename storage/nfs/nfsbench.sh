@@ -11,6 +11,8 @@
 #   Subcommands
 #     run    <label> <mountpoint>   env snapshot (client+server) + fabric + fio suite
 #     fio    <label> <mountpoint>   fio suite only (use on extra clients for aggregate runs)
+#     local  <label> <directory>    on the NAS itself: fio suite against the dataset, no NFS
+#                                   (storage maximum; use SIZE large enough to exceed RAM/ARC)
 #     fabric <label>                iperf3 (IPoIB/TCP) + perftest (raw RDMA) to the server
 #     env    <label> <server|client> [mountpoint]   config snapshot of THIS host
 #     check                         report missing tools
@@ -26,6 +28,7 @@
 #     SIZE=8G               file size per fio job
 #     RUNTIME=60 RAMP=10    seconds per fio test (measured) and warm-up (discarded)
 #     TESTS=all             comma list of test names to run (see TEST_DEFS below)
+#     META_JOBS=8 META_FILES=5000   metadata tests: parallel jobs, files per job
 #     SKIP_FABRIC=0         set 1 to skip fabric tests in "run"
 #
 # Example:
@@ -49,6 +52,9 @@ SIZE=${SIZE:-8G}
 RUNTIME=${RUNTIME:-60}
 RAMP=${RAMP:-10}
 TESTS=${TESTS:-all}
+META_JOBS=${META_JOBS:-8}
+META_FILES=${META_FILES:-5000}
+LOCAL=0
 SKIP_FABRIC=${SKIP_FABRIC:-0}
 HOST=$(hostname -s)
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
@@ -62,7 +68,15 @@ TEST_DEFS=(
   "mixed_64k_70r  randrw     64k  16      4"
   "lat_write_4k   randwrite  4k   1       1"
   "lat_read_4k    randread   4k   1       1"
+  # metadata: empty files, timed per operation; run in this order (stat and delete reuse the created files)
+  "meta_create    filecreate -    1       $META_JOBS"
+  "meta_stat      filestat   -    1       $META_JOBS"
+  "meta_delete    filedelete -    1       $META_JOBS"
 )
+# Open-ended samplers (metadata tests run for a file count, not a time) use this sample
+# count as a marker so samplers_stop can find them.
+OPEN_COUNT=86399
+SAMPLER_RE="^(mpstat|iostat|zpool iostat)( .*)? 1 $OPEN_COUNT\$"
 
 log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die()  { log "ERROR: $*"; exit 1; }
@@ -194,51 +208,116 @@ cmd_fabric() {
 # ---------------------------------------------------------------- fio suite
 selected() { [[ $TESTS == all ]] || [[ ",$TESTS," == *",$1,"* ]]; }
 
+storage_cmd() {   # storage I/O sampler: zpool iostat on ZFS hosts, iostat -x otherwise
+  echo "if command -v zpool >/dev/null && [ -n \"\$(zpool list -H -o name 2>/dev/null)\" ]; then zpool iostat -y $ZPOOL 1 $1; else LC_ALL=C iostat -dxmy 1 $1; fi"
+}
+
+# samplers_start <name> <delay> <count>: CPU and storage samplers for one test.
+# NFS mode: client mpstat locally, server mpstat + storage over ssh. Local mode: all on this host.
+samplers_start() {
+  local name=$1 delay=$2 count=$3
+  if ((LOCAL)); then
+    (sleep "$delay"; LC_ALL=C exec mpstat 1 "$count") > "$sdir/$name.mpstat.txt" 2>&1 &
+    (sleep "$delay"; eval "$(storage_cmd "$count")") > "$sdir/$name.storage_iostat.txt" 2>&1 &
+    return
+  fi
+  (sleep "$delay"; LC_ALL=C exec mpstat 1 "$count") > "$cdir/$name.mpstat.txt" 2>&1 &
+  if [[ -n $SERVER_SSH ]]; then
+    srv "sleep $delay; LC_ALL=C exec mpstat 1 $count" > "$sdir/$name.mpstat.txt" 2>&1 &
+    srv "sleep $delay; $(storage_cmd "$count")" > "$sdir/$name.storage_iostat.txt" 2>&1 &
+  fi
+}
+
+# samplers_stop: end open-ended samplers. SIGINT first so mpstat prints its averages.
+samplers_stop() {
+  if [[ -n $SERVER_SSH ]] && ! ((LOCAL)); then
+    srv "pkill -INT -f '$SAMPLER_RE'; sleep 1; pkill -f '$SAMPLER_RE'" >/dev/null 2>&1
+  fi
+  pkill -INT -f "$SAMPLER_RE"; sleep 1; pkill -f "$SAMPLER_RE"
+  return 0
+}
+
 cmd_fio() {
   local label=$1 mnt=$2
-  [[ -d $mnt ]] || die "mountpoint $mnt not found"
+  [[ -d $mnt ]] || die "$mnt not found"
   local base="$RESULTS/$label"
   local fdir="$base/fio/$HOST" cdir="$base/client/$HOST" sdir="$base/server"
   local wdir="$mnt/nfsbench.$HOST"
   mkdir -p "$fdir" "$cdir" || die "cannot create $base"
-  mkdir -p "$wdir" || die "cannot create $wdir on the NFS mount"
+  mkdir -p "$wdir" || die "cannot create $wdir"
   {
     kv label "$label"; kv host "$HOST"; kv date "$(date -Is)"
+    if ((LOCAL)); then kv capture "local on the NAS (no NFS)"; else kv capture "NFS client"; fi
     kv mountpoint "$(findmnt -no TARGET --target "$mnt")"
     kv workdir "$wdir"; kv size_per_job "$SIZE"; kv runtime "$RUNTIME"; kv ramp "$RAMP"
+    kv meta_files "$META_JOBS jobs x $META_FILES files"
     kv fio_version "$(fio --version 2>/dev/null)"
   } > "$cdir/meta.txt"
-  [[ -n $SERVER_SSH ]] && mkdir -p "$sdir"
+  { ((LOCAL)) || [[ -n $SERVER_SSH ]]; } && mkdir -p "$sdir"
 
-  local def name rw bs qd nj extra
+  local def name rw bs qd nj extra meta engines
+  engines=$(fio --enghelp 2>/dev/null)
   for def in "${TEST_DEFS[@]}"; do
     read -r name rw bs qd nj <<< "$def"
     selected "$name" || continue
-    extra=()
-    [[ $rw == randrw ]] && extra+=(--rwmixread=70)
-    log "fio: $name (rw=$rw bs=$bs iodepth=$qd numjobs=$nj size=$SIZE)"
-
-    cp /proc/self/mountstats "$cdir/$name.mountstats.before"
-    (sleep "$RAMP"; LC_ALL=C mpstat 1 "$RUNTIME" > "$cdir/$name.mpstat.txt" 2>&1) &
-    if [[ -n $SERVER_SSH ]]; then
-      srv cat /proc/fs/nfsd/pool_stats > "$sdir/$name.pool_stats.before" 2>&1
-      srv "sleep $RAMP; LC_ALL=C mpstat 1 $RUNTIME" > "$sdir/$name.mpstat.txt" 2>&1 &
-      srv "sleep $RAMP; if command -v zpool >/dev/null && [ -n \"\$(zpool list -H -o name 2>/dev/null)\" ]; then zpool iostat -y $ZPOOL 1 $RUNTIME; else LC_ALL=C iostat -dxmy 1 $RUNTIME; fi" \
-        > "$sdir/$name.storage_iostat.txt" 2>&1 &
+    meta=0; [[ $rw == file* ]] && meta=1
+    if ((meta)) && ! grep -qw "$rw" <<< "$engines"; then
+      log "fio: skipping $name (this fio has no $rw engine; check fio --enghelp)"; continue
     fi
 
-    fio --name="$name" --directory="$wdir" --filename_format='nfsbench.$jobnum' \
-        --rw="$rw" --bs="$bs" --iodepth="$qd" --numjobs="$nj" --size="$SIZE" \
-        --ioengine=libaio --direct=1 --invalidate=1 --fallocate=none --randrepeat=0 \
-        --time_based --runtime="$RUNTIME" --ramp_time="$RAMP" --group_reporting \
-        "${extra[@]}" --output-format=json --output="$fdir/$name.json" \
-      || log "fio $name failed (see $fdir/$name.json)"
+    if ! ((LOCAL)); then
+      cp /proc/self/mountstats "$cdir/$name.mountstats.before"
+      [[ -n $SERVER_SSH ]] && srv cat /proc/fs/nfsd/pool_stats > "$sdir/$name.pool_stats.before" 2>&1
+    fi
+
+    if ((meta)); then
+      log "fio: $name ($rw, $nj jobs x $META_FILES files)"
+      [[ $name == meta_create ]] && rm -f "$wdir"/nfsbench-meta.* 2>/dev/null
+      samplers_start "$name" 0 "$OPEN_COUNT"
+      fio --name="$name" --directory="$wdir" --filename_format='nfsbench-meta.$jobnum.$filenum' \
+          --ioengine="$rw" --filesize=4k --nrfiles="$META_FILES" --openfiles=1 --create_on_open=1 \
+          --numjobs="$nj" --group_reporting --output-format=json --output="$fdir/$name.json" \
+        || log "fio $name failed (see $fdir/$name.json)"
+      samplers_stop
+    else
+      extra=()
+      [[ $rw == randrw ]] && extra+=(--rwmixread=70)
+      log "fio: $name (rw=$rw bs=$bs iodepth=$qd numjobs=$nj size=$SIZE)"
+      samplers_start "$name" "$RAMP" "$RUNTIME"
+      fio --name="$name" --directory="$wdir" --filename_format='nfsbench.$jobnum' \
+          --rw="$rw" --bs="$bs" --iodepth="$qd" --numjobs="$nj" --size="$SIZE" \
+          --ioengine=libaio --direct=1 --invalidate=1 --fallocate=none --randrepeat=0 \
+          --time_based --runtime="$RUNTIME" --ramp_time="$RAMP" --group_reporting \
+          "${extra[@]}" --output-format=json --output="$fdir/$name.json" \
+        || log "fio $name failed (see $fdir/$name.json)"
+    fi
 
     wait
-    cp /proc/self/mountstats "$cdir/$name.mountstats.after"
-    [[ -n $SERVER_SSH ]] && srv cat /proc/fs/nfsd/pool_stats > "$sdir/$name.pool_stats.after" 2>&1
+    if ! ((LOCAL)); then
+      cp /proc/self/mountstats "$cdir/$name.mountstats.after"
+      [[ -n $SERVER_SSH ]] && srv cat /proc/fs/nfsd/pool_stats > "$sdir/$name.pool_stats.after" 2>&1
+    fi
   done
   log "fio suite done. Test files left in $wdir (remove with: rm -rf $wdir)"
+}
+
+cmd_local() {   # on the NAS: storage maximum without NFS
+  local label=$1 dir=$2
+  LOCAL=1 SERVER_SSH=""
+  local fs; fs=$(findmnt -no FSTYPE --target "$dir" 2>/dev/null)
+  [[ $fs == nfs* ]] && die "$dir is on NFS; 'local' runs on the NAS against the exported dataset"
+  local mem_k jobs bytes
+  mem_k=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+  bytes=$(numfmt --from=iec "${SIZE%B}" 2>/dev/null || echo 0)
+  jobs=4   # sequential tests' numjobs
+  if (( bytes * jobs < mem_k * 1024 )); then
+    log "warning: $jobs x SIZE=$SIZE is less than RAM ($((mem_k / 1048576)) GiB); reads will come from cache."
+    log "         For a storage maximum use e.g. SIZE=$(( (mem_k / 1048576 + jobs - 1) / jobs * 2 ))G (total about 2x RAM)."
+  fi
+  [[ $fs == zfs ]] && log "note: before ZFS 2.3, O_DIRECT does not bypass the ARC; only a data set larger than the ARC measures the disks"
+  cmd_env "$label" server
+  cmd_fio "$label" "$dir"
+  log "done. Compare with an NFS run: python3 nfs_report.py $RESULTS/<nfs-run> $RESULTS/$label"
 }
 
 cmd_check() {
@@ -247,6 +326,12 @@ cmd_check() {
     command -v "$t" >/dev/null || { echo "missing: $t"; missing=1; }
   done
   [[ $missing == 0 ]] && echo "all client-side tools present"
+  if command -v fio >/dev/null; then
+    local e eng; eng=$(fio --enghelp 2>/dev/null)
+    for e in filecreate filestat filedelete; do
+      grep -qw "$e" <<< "$eng" || echo "fio $(fio --version) lacks the $e engine: the meta_* tests will be skipped"
+    done
+  fi
   [[ -n $IBDEV ]] && echo "RDMA device: $IBDEV, IPoIB: ${IPOIB_IF:-none}" || echo "missing: no RDMA device found"
   local id="" like="" ver=""
   [[ -r /etc/os-release ]] && { id=$(. /etc/os-release; echo "${ID:-}"); like=$(. /etc/os-release; echo "${ID_LIKE:-}"); ver=$(. /etc/os-release; echo "${VERSION_ID:-}"); }
@@ -275,6 +360,7 @@ cmd_run() {
 case ${1:-} in
   run)      [[ $# -eq 3 ]] || die "usage: $0 run <label> <mountpoint>";    cmd_run "$2" "$3" ;;
   fio)      [[ $# -eq 3 ]] || die "usage: $0 fio <label> <mountpoint>";    cmd_fio "$2" "$3" ;;
+  local)    [[ $# -eq 3 ]] || die "usage: $0 local <label> <directory>";   cmd_local "$2" "$3" ;;
   fabric)   [[ $# -eq 2 ]] || die "usage: $0 fabric <label>";              cmd_fabric "$2" ;;
   env)      [[ $# -ge 3 ]] || die "usage: $0 env <label> <server|client> [mountpoint]"
             cmd_env "$2" "$3" "${4:-}" ;;
