@@ -5,8 +5,8 @@ HTML + Markdown report.
     python3 nfs_report.py results/baseline results/rdma -o nfs-report.html
 
 The first directory is the reference; every later run gets a "% change vs
-<first>" column. Works with Python 3.6+ (Springdale/RHEL 8 platform python),
-standard library only.
+<first>" column. Works with Python 3.6+ (the python3 on EL7-EL10 and
+Ubuntu 24.04/26.04), standard library only.
 """
 import argparse
 import datetime
@@ -18,7 +18,8 @@ import re
 import sys
 
 TEST_ORDER = ["seq_read_1m", "seq_write_1m", "rand_read_4k", "rand_write_4k",
-              "mixed_64k_70r", "lat_read_4k", "lat_write_4k"]
+              "mixed_64k_70r", "lat_read_4k", "lat_write_4k",
+              "meta_create", "meta_stat", "meta_delete"]
 TEST_TITLES = {
     "seq_read_1m": "Sequential read, 1 MiB blocks (QD16 x 4 jobs)",
     "seq_write_1m": "Sequential write, 1 MiB blocks (QD16 x 4 jobs)",
@@ -27,7 +28,14 @@ TEST_TITLES = {
     "mixed_64k_70r": "Mixed 70% read / 30% write, 64 KiB (QD16 x 4 jobs)",
     "lat_read_4k": "Latency probe: random read 4 KiB, QD1",
     "lat_write_4k": "Latency probe: random write 4 KiB, QD1",
+    "meta_create": "Metadata: create empty files",
+    "meta_stat": "Metadata: stat files",
+    "meta_delete": "Metadata: delete files",
 }
+# NFS RPCs that carry each metadata test (v4 creates through OPEN, v3 through CREATE)
+META_RPCS = {"meta_create": ("OPEN", "CREATE"), "meta_stat": ("GETATTR", "LOOKUP"),
+             "meta_delete": ("REMOVE",)}
+RPC_OPS = ("READ", "WRITE", "OPEN", "CREATE", "GETATTR", "LOOKUP", "REMOVE")
 
 # ------------------------------------------------------------------ parsing
 
@@ -75,6 +83,7 @@ def fio_side(job, side):
     return {
         "bw_mib": s.get("bw", 0) / 1024.0,          # fio reports KiB/s
         "iops": s.get("iops", 0.0),
+        "ios": s.get("total_ios", 0),
         "lat_mean_us": clat.get("mean", 0) / 1000.0,
         "lat_p99_us": (p99 / 1000.0) if p99 else None,
     }
@@ -103,30 +112,49 @@ def aggregate_hosts(per_host):
         mean = (sum(v["lat_mean_us"] * v["iops"] for v in vals) / iops) if iops else 0
         p99s = [v["lat_p99_us"] for v in vals if v["lat_p99_us"] is not None]
         agg[side] = {"bw_mib": sum(v["bw_mib"] for v in vals), "iops": iops,
+                     "ios": sum(v.get("ios", 0) for v in vals),
                      "lat_mean_us": mean, "lat_p99_us": max(p99s) if p99s else None}
     return agg
 
 
 def parse_mpstat(path):
-    """Average CPU busy % and kernel (sys+irq+soft) % from `mpstat 1 N`."""
+    """Average CPU busy % and kernel (sys+irq+soft) % from `mpstat 1 N`.
+
+    Uses the Average line; if mpstat was stopped before printing it, averages
+    the per-second "all" lines instead.
+    """
     txt = read_text(path)
     if not txt:
         return None
-    header = None
+
+    def cpu(header, f):
+        row = dict(zip(header, f))
+        try:
+            idle = float(row["%idle"])
+            kern = sum(float(row.get(k, 0)) for k in ("%sys", "%irq", "%soft"))
+            return {"busy": 100.0 - idle, "kernel": kern}
+        except (KeyError, ValueError):
+            return None
+
+    header, avg_header, samples = None, None, []
     for line in txt.splitlines():
         f = line.split()
-        if len(f) > 2 and f[0] == "Average:":
+        if len(f) < 3:
+            continue
+        if f[0] == "Average:":
             if f[1] == "CPU":
-                header = f
-            elif f[1] == "all" and header:
-                row = dict(zip(header, f))
-                try:
-                    idle = float(row["%idle"])
-                    kern = sum(float(row.get(k, 0)) for k in ("%sys", "%irq", "%soft"))
-                    return {"busy": 100.0 - idle, "kernel": kern}
-                except (KeyError, ValueError):
-                    return None
-    return None
+                avg_header = f
+            elif f[1] == "all" and avg_header:
+                return cpu(avg_header, f)
+        elif f[1] == "CPU":
+            header = f
+        elif f[1] == "all" and header:
+            c = cpu(header, f)
+            if c:
+                samples.append(c)
+    if not samples:
+        return None
+    return {k: sum(c[k] for c in samples) / len(samples) for k in ("busy", "kernel")}
 
 
 def parse_pool_stats(path):
@@ -147,13 +175,20 @@ def parse_pool_stats(path):
 
 
 def nfsd_queue_pct(before, after):
+    """% of arrivals that found no idle nfsd thread: (arrived - woken) / arrived.
+
+    sockets-enqueued is not used: since EL8's 4.18 kernel it counts every
+    enqueue (equal to, or above, packets-arrived), not only those that waited.
+    threads-woken counts only wake-ups of a sleeping idle thread on every
+    kernel from EL7's 3.10 to current upstream, so this works on all of them.
+    """
     if not before or not after:
         return None
     arr = after.get("packets-arrived", 0) - before.get("packets-arrived", 0)
-    enq = after.get("sockets-enqueued", 0) - before.get("sockets-enqueued", 0)
+    woke = after.get("threads-woken", 0) - before.get("threads-woken", 0)
     if arr <= 0:
         return None
-    return 100.0 * enq / arr
+    return max(0.0, 100.0 * (arr - woke) / arr)
 
 
 MOUNT_RE = re.compile(r"^device (\S+) mounted on (\S+) with fstype (nfs\S*)")
@@ -266,7 +301,8 @@ def load_run(path):
         tests.update(os.path.splitext(os.path.basename(p))[0]
                      for p in glob.glob(os.path.join(path, "fio", h, "*.json")))
     for t in tests:
-        per_host, cpu, rd, wr = [], [], [], []
+        per_host, cpu = [], []
+        rpc = {op: [] for op in RPC_OPS}
         for h in hosts:
             per_host.append(parse_fio(os.path.join(path, "fio", h, t + ".json")))
             cdir = os.path.join(path, "client", h)
@@ -277,10 +313,10 @@ def load_run(path):
             mp = meta.get("mountpoint", "")
             mb = parse_mountstats(os.path.join(cdir, t + ".mountstats.before"), mp)
             ma = parse_mountstats(os.path.join(cdir, t + ".mountstats.after"), mp)
-            for op, acc in (("READ", rd), ("WRITE", wr)):
+            for op in RPC_OPS:
                 r = rpc_times(mb, ma, op)
                 if r:
-                    acc.append(r)
+                    rpc[op].append(r)
             if ma and ma.get("xprt"):
                 run.setdefault("xprt", ma["xprt"])
         sdir = os.path.join(path, "server")
@@ -292,11 +328,13 @@ def load_run(path):
                 parse_pool_stats(os.path.join(sdir, t + ".pool_stats.before")),
                 parse_pool_stats(os.path.join(sdir, t + ".pool_stats.after"))),
         }
-        for name, acc in (("rpc_read", rd), ("rpc_write", wr)):
+        entry["rpc"] = {}
+        for op, acc in rpc.items():
             ops = sum(r["ops"] for r in acc)
-            entry[name] = ({"rtt_ms": sum(r["rtt_ms"] * r["ops"] for r in acc) / ops,
-                            "exec_ms": sum(r["exec_ms"] * r["ops"] for r in acc) / ops}
-                           if ops else None)
+            entry["rpc"][op] = ({"ops": ops,
+                                 "rtt_ms": sum(r["rtt_ms"] * r["ops"] for r in acc) / ops,
+                                 "exec_ms": sum(r["exec_ms"] * r["ops"] for r in acc) / ops}
+                                if ops else None)
         run["fio"][t] = entry
     meta0 = parse_kv(os.path.join(path, "client", hosts[0], "meta.txt")) if hosts else {}
     run["meta"] = meta0
@@ -326,6 +364,11 @@ def fmt_num(v, nd=0):
     return "{:,.{}f}".format(v, nd)
 
 
+def per_file(run, test, op):
+    ops, ios = g(run, "fio", test, "rpc", op, "ops"), g(run, "fio", test, "fio", "read", "ios")
+    return (ops / ios) if ops and ios else None
+
+
 def build_rows(runs):
     """Return report sections: list of (title, note, rows); row = dict."""
     sections = []
@@ -333,11 +376,15 @@ def build_rows(runs):
     # Configuration
     cfg = [
         ("server", "os", "Server OS"), ("server", "kernel", "Server kernel"),
+        ("server", "platform", "Server platform"),
         ("server", "cpu_model", "Server CPU"), ("server", "cpu_sockets", "Server sockets"),
         ("server", "cpu_logical", "Server logical CPUs"), ("server", "mem_gib", "Server RAM (GiB)"),
+        ("server", "storage", "Exported filesystems"),
         ("server", "arc_max_gib", "ZFS ARC max (GiB)"), ("server", "zfs_version", "ZFS version"),
         ("server", "nfsd_threads", "nfsd threads"), ("server", "nfsd_listeners", "nfsd listeners"),
         ("server", "sunrpc_pool_mode", "sunrpc pool_mode"),
+        ("server", "hca", "Server HCA (type, firmware)"), ("server", "ib_driver", "Server HCA driver"),
+        ("server", "pcie_link", "Server HCA PCIe link"), ("server", "ib_rate", "Server IB link rate"),
         ("server", "ib_active_mtu", "Server IB active MTU"),
         ("server", "ipoib_mode", "Server IPoIB mode"), ("server", "ipoib_mtu", "Server IPoIB MTU"),
         ("client", "ib_active_mtu", "Client IB active MTU"),
@@ -346,11 +393,17 @@ def build_rows(runs):
     ]
     rows = [{"name": label, "vals": [g(r, "env", role, key) or "—" for r in runs],
              "text": True} for role, key, label in cfg]
+    # Drop rows that are empty for every run (e.g. ZFS rows on a non-ZFS server)
+    rows = [r for r in rows if any(v != "—" for v in r["vals"])]
     rows.insert(0, {"name": "NFS transport (from mountstats)",
                     "vals": [r.get("xprt") or "—" for r in runs], "text": True})
     rows.insert(1, {"name": "Client hosts in run",
                     "vals": [", ".join(r["hosts"]) or "—" for r in runs], "text": True})
-    rows.insert(2, {"name": "fio size / runtime per test",
+    rows.insert(2, {"name": "Capture",
+                    "vals": [g(r, "meta", "capture") or "NFS client" for r in runs], "text": True})
+    rows.insert(3, {"name": "Metadata tests",
+                    "vals": [g(r, "meta", "meta_files") or "—" for r in runs], "text": True})
+    rows.insert(4, {"name": "fio size / runtime per test",
                     "vals": ["{} per job / {}s".format(g(r, "meta", "size_per_job") or "?",
                                                       g(r, "meta", "runtime") or "?") for r in runs],
                     "text": True})
@@ -367,16 +420,39 @@ def build_rows(runs):
         {"name": "RDMA read latency, typical (ib_read_lat)", "unit": "µs", "nd": 2,
          "better": "down", "vals": [g(r, "fabric", "ib_read_lat", "typical_us") for r in runs]},
     ]
+    rate = next((g(r, "env", "server", "ib_rate") or g(r, "env", "client", "ib_rate")
+                 for r in runs if g(r, "env", "server", "ib_rate") or g(r, "env", "client", "ib_rate")),
+                None)
     sections.append(("Fabric ceiling",
-                     "Raw network capability, independent of NFS and ZFS. EDR line rate is "
-                     "100 Gb/s; NFS cannot exceed what these show.", rows))
+                     "Raw network capability, independent of NFS and the storage. "
+                     + ("Link rate: {}. ".format(rate) if rate else "")
+                     + "NFS cannot exceed what these show.", rows))
 
     # Per-test
     tests = [t for t in TEST_ORDER if any(t in r["fio"] for r in runs)]
     tests += sorted({t for r in runs for t in r["fio"]} - set(tests))
     for t in tests:
         rows = []
-        for side in ("read", "write"):
+        if t in META_RPCS:
+            rows += [
+                {"name": "Operations per second", "unit": "ops/s", "nd": 0, "better": "up",
+                 "bar": True, "vals": [g(r, "fio", t, "fio", "read", "iops") for r in runs]},
+                {"name": "Time per operation, mean", "unit": "µs", "nd": 1, "better": "down",
+                 "vals": [g(r, "fio", t, "fio", "read", "lat_mean_us") for r in runs]},
+                {"name": "Time per operation, p99", "unit": "µs", "nd": 1, "better": "down",
+                 "vals": [g(r, "fio", t, "fio", "read", "lat_p99_us") for r in runs]},
+            ]
+            for op in META_RPCS[t]:
+                if not any(g(r, "fio", t, "rpc", op) for r in runs):
+                    continue
+                rows += [
+                    {"name": "NFS " + op + " RPC round-trip (client view)", "unit": "ms", "nd": 3,
+                     "better": "down", "vals": [g(r, "fio", t, "rpc", op, "rtt_ms") for r in runs]},
+                    {"name": "NFS " + op + " RPCs per file (below 1 = served from client cache)",
+                     "unit": "", "nd": 2, "better": None,
+                     "vals": [per_file(r, t, op) for r in runs]},
+                ]
+        for side in (() if t in META_RPCS else ("read", "write")):
             if not any(g(r, "fio", t, "fio", side) for r in runs):
                 continue
             S = side.capitalize()
@@ -393,7 +469,7 @@ def build_rows(runs):
                  "vals": [g(r, "fio", t, "fio", side, "lat_p99_us") for r in runs]},
                 {"name": "NFS " + side.upper() + " RPC round-trip (client view)", "unit": "ms",
                  "nd": 3, "better": "down",
-                 "vals": [g(r, "fio", t, "rpc_" + side, "rtt_ms") for r in runs]},
+                 "vals": [g(r, "fio", t, "rpc", side.upper(), "rtt_ms") for r in runs]},
             ]
         rows += [
             {"name": "Server CPU busy", "unit": "%", "nd": 1, "better": "down",
@@ -402,7 +478,7 @@ def build_rows(runs):
              "vals": [g(r, "fio", t, "server_cpu", "kernel") for r in runs]},
             {"name": "Client CPU busy (avg of clients)", "unit": "%", "nd": 1, "better": "down",
              "vals": [g(r, "fio", t, "client_cpu") for r in runs]},
-            {"name": "nfsd arrivals that waited for a free thread", "unit": "%", "nd": 2,
+            {"name": "nfsd arrivals that found no idle thread", "unit": "%", "nd": 2,
              "better": "down", "vals": [g(r, "fio", t, "nfsd_queue_pct") for r in runs]},
         ]
         sections.append((TEST_TITLES.get(t, t), "fio test: " + t, rows))
@@ -421,6 +497,9 @@ def headline(runs, tests):
             side = "write" if "write" in t else "read"
             out.append((TEST_TITLES.get(t, t).split(",")[0] + " — IOPS", "IOPS", 0, "up",
                         [g(r, "fio", t, "fio", side, "iops") for r in runs]))
+        elif t in META_RPCS:
+            out.append((TEST_TITLES.get(t, t) + " — operations/s", "ops/s", 0, "up",
+                        [g(r, "fio", t, "fio", "read", "iops") for r in runs]))
         elif t.startswith("lat"):
             side = "write" if "write" in t else "read"
             out.append(("QD1 " + TEST_TITLES.get(t, t).split(":")[1].strip().split(",")[0]
@@ -463,7 +542,7 @@ def delta_cell(base, new, better):
     if p is None:
         return '<td class="flat">—</td>', "—"
     good = (p > 0) == (better == "up")
-    cls = "flat" if abs(p) < 2 else ("up" if good else "down")
+    cls = "flat" if better is None or abs(p) < 2 else ("up" if good else "down")
     s = "{:+.1f}%".format(p)
     return '<td class="{}">{}</td>'.format(cls, s), s
 
@@ -569,7 +648,8 @@ def render_md(runs, tests, sections, title):
                 continue
             cells = [fmt_num(v, r["nd"]) for v in r["vals"]]
             cells += [delta_cell(r["vals"][0], v, r["better"])[1] for v in r["vals"][1:]]
-            L.append("| {} ({}) | {} |".format(r["name"], r["unit"], " | ".join(cells)))
+            name = "{} ({})".format(r["name"], r["unit"]) if r["unit"] else r["name"]
+            L.append("| {} | {} |".format(name, " | ".join(cells)))
         L.append("")
     return "\n".join(L)
 
